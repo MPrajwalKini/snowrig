@@ -22,7 +22,7 @@ from typing import Any
 from snowflake.core.exceptions import NotFoundError
 
 from snowrig.manifest.schema import ManifestObject, ObjectKey
-from snowrig.resources.core_client import CoreObjectClient
+from snowrig.resources.core_client import CoreObjectClient, describe_error
 from snowrig.sql import SqlRunner
 
 
@@ -99,7 +99,9 @@ def compute_plan(
             plan.append(PlannedChange(obj=obj, key=key, action=Action.CREATE, diff={}))
             continue
         except Exception as exc:  # noqa: BLE001
-            plan.append(PlannedChange(obj=obj, key=key, action=Action.ERROR, diff={}, error=str(exc)))
+            plan.append(
+                PlannedChange(obj=obj, key=key, action=Action.ERROR, diff={}, error=describe_error(exc))
+            )
             continue
 
         diff = _diff_fields(live, obj.body)
@@ -153,7 +155,7 @@ def apply_plan(
                 client.create_or_alter(change.obj.resource, change.obj.path_params, change.obj.body)
             results.append((change, None))
         except Exception as exc:  # noqa: BLE001
-            results.append((change, str(exc)))
+            results.append((change, describe_error(exc)))
             if stop_on_error:
                 break
 

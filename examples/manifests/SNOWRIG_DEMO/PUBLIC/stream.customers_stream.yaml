@@ -1,0 +1,23 @@
+resource: stream
+path_params:
+  database: SNOWRIG_DEMO
+  schema: PUBLIC
+  name: CUSTOMERS_STREAM
+body:
+  # `table_name` looks like the obvious field but is actually read-only
+  # (server-computed for display) — any value passed there is ignored
+  # by snowflake.core, and its strict validator rejects free-form strings,
+  # which is why apply originally failed with a regex error on it.
+  #
+  # The real settable field is `stream_source`. It's declared as the
+  # abstract StreamSource base, but the API actually needs a concrete
+  # subclass (StreamSourceTable here) carrying a type discriminator.
+  # A plain dict passes local Pydantic validation fine (StreamSource has
+  # a `name` field too) but the API itself 400s on the missing
+  # discriminator — so snowrig's core_client.py explicitly constructs
+  # StreamSourceTable(**this dict) before sending it. See the
+  # `_BODY_COERCERS` note in core_client.py and CONTRIBUTING.md.
+  stream_source:
+    name: CUSTOMERS
+depends_on:
+  - "table:SNOWRIG_DEMO.PUBLIC.CUSTOMERS"

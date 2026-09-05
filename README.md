@@ -133,7 +133,9 @@ sql: |
 
 Working: key-pair auth via the official connector, `snowrig exec`,
 `snowrig transaction`, `snowrig fetch`, `snowrig plan`, `snowrig apply`,
-dependency-ordered manifest deployment.
+dependency-ordered manifest deployment, explicit coercion for the handful
+of non-JSON-primitive fields that need it (`Task.schedule`,
+`Stream.stream_source` — see CONTRIBUTING.md).
 
 Not yet built: broader resource coverage (`snowflake.core` supports far
 more than the 6 types wired up in `resources/core_registry.py` — adding

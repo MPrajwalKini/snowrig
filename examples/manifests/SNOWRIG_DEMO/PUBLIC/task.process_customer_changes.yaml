@@ -1,0 +1,23 @@
+resource: task
+path_params:
+  database: SNOWRIG_DEMO
+  schema: PUBLIC
+  name: PROCESS_CUSTOMER_CHANGES
+body:
+  warehouse: COMPUTE_WH
+  definition: "CALL SNOWRIG_DEMO.PUBLIC.sql_api_stored_proc('SNOWRIG_DEMO.PUBLIC.CUSTOMERS')"
+  # Task.schedule is typed as `Cron | timedelta | None` — a real Python
+  # object with no JSON-primitive equivalent, so this can't be a plain
+  # string. snowrig's core_client.py explicitly coerces either shape
+  # below before constructing the Task model:
+  #
+  #   schedule: {minutes: 5}                       -> timedelta(minutes=5)
+  #   schedule: {cron: "*/5 * * * *", timezone: UTC} -> Cron(expr=..., timezone=...)
+  #
+  # Using a plain interval here; swap to the cron form if you need
+  # specific times/days instead of "every N minutes".
+  schedule:
+    minutes: 5
+depends_on:
+  - "stream:SNOWRIG_DEMO.PUBLIC.CUSTOMERS_STREAM"
+  - "procedure:SNOWRIG_DEMO.PUBLIC.sql_api_stored_proc(VARCHAR)"
