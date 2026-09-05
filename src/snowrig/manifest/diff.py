@@ -4,7 +4,15 @@ is deliberately a shallow, key-subset comparison rather than a full
 semantic diff — snowflake.core's fetched models include many server-
 computed fields (timestamps, owner, clustering stats, etc.) that aren't
 part of what you declared, so we only compare the keys you actually
-specified in `body`.
+specified in `body`. That's intentional for scalar fields.
+
+For list-of-dict fields (currently just `columns`), it's a different
+story: the manifest's list is treated as *authoritative/exhaustive* for
+that field, so an item present live but missing from the manifest (e.g. a
+column that used to be declared and no longer is) is flagged as a
+DESTRUCTIVE removal, not silently absorbed into a generic "changed" diff.
+`apply_plan` refuses to execute destructive changes unless explicitly
+told to via `allow_destructive=True`.
 
 Objects with a raw `sql:` body (procedures, functions, anything better
 expressed as CREATE OR REPLACE than a typed model) skip the live-fetch
@@ -15,7 +23,7 @@ this is safe, just less informative than a real field diff.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
@@ -34,46 +42,89 @@ class Action(str, Enum):
 
 
 @dataclass
+class FieldDiff:
+    live: Any
+    desired: Any
+    # Names of list-items present live but absent from the manifest for
+    # this field (e.g. dropped columns). Empty for non-destructive changes.
+    removed_items: list[str] = field(default_factory=list)
+
+    @property
+    def is_destructive(self) -> bool:
+        return bool(self.removed_items)
+
+
+@dataclass
 class PlannedChange:
     obj: ManifestObject
     key: ObjectKey
     action: Action
-    diff: dict[str, tuple[Any, Any]]
+    diff: dict[str, FieldDiff]
     error: str | None = None
+    blocked: str | None = None  # set by apply_plan if a destructive change was skipped
+
+    @property
+    def is_destructive(self) -> bool:
+        return any(d.is_destructive for d in self.diff.values())
+
+    def destructive_summary(self) -> str:
+        """e.g. 'columns: EMAIL, PHONE will be dropped'"""
+        parts = []
+        for fname, d in self.diff.items():
+            if d.removed_items:
+                parts.append(f"{fname}: {', '.join(d.removed_items)} will be dropped")
+        return "; ".join(parts)
+
+
+def _diff_list_field(live_value: Any, desired_value: list[dict[str, Any]]) -> FieldDiff | None:
+    """Compares a list-of-dict field (currently: `columns`). The manifest's
+    list is authoritative: any named item present live but absent from
+    `desired_value` is a destructive removal, and any named item present
+    in both is compared only on the sub-fields the manifest declared."""
+    live_list: list[dict[str, Any]] = live_value if isinstance(live_value, list) else []
+    live_by_name: dict[str, dict[str, Any]] = {
+        str(item["name"]): item for item in live_list if isinstance(item, dict) and "name" in item
+    }
+    desired_by_name: dict[str, dict[str, Any]] = {
+        str(item["name"]): item for item in desired_value if isinstance(item, dict) and "name" in item
+    }
+
+    removed: list[str] = [name for name in live_by_name if name not in desired_by_name]
+
+    changed = False
+    for name, desired_item in desired_by_name.items():
+        live_item = live_by_name.get(name)
+        if live_item is None:
+            changed = True  # new item — additive, not destructive
+            continue
+        for k, v in desired_item.items():
+            if str(live_item.get(k)).lower() != str(v).lower():
+                changed = True
+
+    if not removed and not changed:
+        return None
+    return FieldDiff(live=live_value, desired=desired_value, removed_items=removed)
 
 
 def _values_match(live_value: Any, desired_value: Any) -> bool:
-    """Loose equality that handles Snowflake's richer live representations
-    of things you declared minimally — notably column lists, where a live
-    fetch includes nullable/ordinal/etc. that your manifest never mentioned."""
-    if isinstance(desired_value, list) and isinstance(live_value, list):
-        if all(isinstance(d, dict) for d in desired_value) and all(
-            isinstance(l, dict) for l in live_value
-        ):
-            if len(desired_value) != len(live_value):
-                return False
-            live_by_name = {item.get("name"): item for item in live_value if "name" in item}
-            for desired_item in desired_value:
-                name = desired_item.get("name")
-                live_item = live_by_name.get(name)
-                if live_item is None:
-                    return False
-                # Only compare the sub-fields you actually specified — a
-                # live column carrying extra metadata you never declared
-                # (nullable, ordinal position, ...) isn't a "change".
-                for k, v in desired_item.items():
-                    if str(live_item.get(k)).lower() != str(v).lower():
-                        return False
-            return True
+    """Loose equality for scalar/non-list fields."""
     return str(live_value).lower() == str(desired_value).lower()
 
 
-def _diff_fields(live: dict[str, Any], desired: dict[str, Any]) -> dict[str, tuple[Any, Any]]:
-    changes = {}
-    for field, desired_value in desired.items():
-        live_value = live.get(field)
+def _diff_fields(live: dict[str, Any], desired: dict[str, Any]) -> dict[str, FieldDiff]:
+    changes: dict[str, FieldDiff] = {}
+    for field_name, desired_value in desired.items():
+        live_value = live.get(field_name)
+
+        if isinstance(desired_value, list) and all(isinstance(d, dict) for d in desired_value):
+            list_diff = _diff_list_field(live_value, desired_value)
+            if list_diff is not None:
+                changes[field_name] = list_diff
+            continue
+
         if not _values_match(live_value, desired_value):
-            changes[field] = (live_value, desired_value)
+            changes[field_name] = FieldDiff(live=live_value, desired=desired_value)
+
     return changes
 
 
@@ -88,7 +139,7 @@ def compute_plan(
             plan.append(
                 PlannedChange(
                     obj=obj, key=key, action=Action.UPDATE,
-                    diff={"sql": ("<existing>", "<manifest-defined, will re-apply>")},
+                    diff={"sql": FieldDiff(live="<existing>", desired="<manifest-defined, will re-apply>")},
                 )
             )
             continue
@@ -120,10 +171,15 @@ def apply_plan(
     role: str | None = None,
     dry_run: bool = False,
     stop_on_error: bool = True,
+    allow_destructive: bool = False,
 ) -> list[tuple[PlannedChange, str | None]]:
     """Executes every CREATE/UPDATE item: via create_or_alter() normally, or
     via raw SQL for objects with a `sql:` body. Returns (change, error) per
-    attempted item, in the order applied."""
+    attempted item, in the order applied.
+
+    Destructive changes (a manifest that drops a previously-declared column,
+    etc.) are skipped and reported via `change.blocked` unless
+    `allow_destructive=True` is passed explicitly."""
     results: list[tuple[PlannedChange, str | None]] = []
 
     for change in plan:
@@ -134,6 +190,17 @@ def apply_plan(
             continue
         if change.action == Action.NOOP:
             continue
+
+        if change.is_destructive and not allow_destructive:
+            change.blocked = (
+                f"Skipped — destructive change requires --allow-destructive: "
+                f"{change.destructive_summary()}"
+            )
+            results.append((change, change.blocked))
+            if stop_on_error:
+                break
+            continue
+
         if dry_run:
             results.append((change, None))
             continue

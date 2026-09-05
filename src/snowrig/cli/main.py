@@ -147,6 +147,8 @@ def plan(
         table = Table("Action", "Resource", "Object", "Changed fields")
         for change in plan_result:
             fields = ", ".join(change.diff.keys()) if change.diff else (change.error or "")
+            if change.is_destructive:
+                fields = f"[red]\u26a0 DESTRUCTIVE[/red] {fields} \u2014 {change.destructive_summary()}"
             table.add_row(
                 _action_style(change.action), change.key.resource, change.key.qualified_name, fields
             )
@@ -162,6 +164,13 @@ def apply(
     dry_run: bool = typer.Option(False, help="Show what would happen without executing anything"),
     continue_on_error: bool = typer.Option(
         False, help="Keep applying remaining objects after a failure instead of stopping"
+    ),
+    allow_destructive: bool = typer.Option(
+        False,
+        help=(
+            "Allow changes that drop columns or other manifest-declared items. "
+            "Without this, destructive changes are skipped and reported as BLOCKED."
+        ),
     ),
 ) -> None:
     """Apply a manifest to Snowflake, in dependency order."""
@@ -183,12 +192,15 @@ def apply(
             plan_result, client, sql_runner=sql_runner,
             warehouse=prof.warehouse, role=prof.role,
             dry_run=dry_run, stop_on_error=not continue_on_error,
+            allow_destructive=allow_destructive,
         )
 
         for change, error in results:
             label = f"{change.key.resource}:{change.key.qualified_name}"
-            if error:
-                console.print(f"  [red]FAILED[/red]  {label} — {error}")
+            if change.blocked:
+                console.print(f"  [yellow]BLOCKED[/yellow]  {label} \u2014 {change.blocked}")
+            elif error:
+                console.print(f"  [red]FAILED[/red]  {label} \u2014 {error}")
             elif dry_run:
                 console.print(f"  [dim]WOULD APPLY[/dim]  {label}")
             else:
