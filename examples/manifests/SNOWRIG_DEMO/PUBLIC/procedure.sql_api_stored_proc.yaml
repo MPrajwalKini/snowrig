@@ -1,0 +1,23 @@
+resource: procedure
+path_params:
+  database: SNOWRIG_DEMO
+  schema: PUBLIC
+  name: sql_api_stored_proc
+body:
+  # Only used to identify the object (overload signature for fetch/delete);
+  # the actual definition below in `sql:` is what gets applied.
+  arguments:
+    - name: table_name
+      datatype: VARCHAR
+sql: |
+  create or replace procedure sql_api_stored_proc(table_name varchar)
+  returns varchar
+  language javascript
+  as
+  $$
+    var sql_command = "select count(*) from " + TABLE_NAME;
+    var rs = snowflake.execute({sqlText: sql_command});
+    rs.next();
+    var rowCount = rs.getColumnValue(1);
+    return rowCount;
+  $$;

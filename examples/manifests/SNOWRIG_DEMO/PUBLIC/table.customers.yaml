@@ -1,0 +1,11 @@
+resource: table
+path_params:
+  database: SNOWRIG_DEMO
+  schema: PUBLIC
+  name: CUSTOMERS
+body:
+  columns:
+    - name: ID
+      datatype: NUMBER(38,0)
+    - name: EMAIL
+      datatype: VARCHAR(255)

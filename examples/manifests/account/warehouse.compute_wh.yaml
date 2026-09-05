@@ -1,0 +1,7 @@
+resource: warehouse
+path_params:
+  name: COMPUTE_WH
+body:
+  warehouse_size: X-Small
+  auto_suspend: 300
+  auto_resume: "true"

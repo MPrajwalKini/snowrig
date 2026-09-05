@@ -1,0 +1,5 @@
+resource: database
+path_params:
+  name: SNOWRIG_DEMO
+body:
+  comment: "Managed by snowrig"
