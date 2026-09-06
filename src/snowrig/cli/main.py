@@ -9,11 +9,10 @@ from rich.console import Console
 from rich.table import Table
 from snowflake.core import Root
 
+import snowrig
+from snowrig import Action
 from snowrig.config import DEFAULT_CONFIG_PATH, load_profile
 from snowrig.connection import connect
-from snowrig.manifest.diff import Action, apply_plan, compute_plan
-from snowrig.manifest.graph import build_apply_order
-from snowrig.manifest.loader import load_manifest_dir
 from snowrig.resources.core_client import CoreObjectClient
 from snowrig.sql import SqlRunner
 
@@ -124,37 +123,26 @@ def _action_style(action: Action) -> str:
     }[action]
 
 
-def _load_and_order(manifest_dir: str):
-    objects = load_manifest_dir(manifest_dir)
-    if not objects:
-        console.print(f"[yellow]No .yaml objects found under {manifest_dir}[/yellow]")
-    return build_apply_order(objects)
-
-
 @app.command()
 def plan(
     manifest_dir: str = typer.Argument(..., help="Path to the manifest directory"),
     profile: str = "default",
 ) -> None:
     """Diff a manifest against live Snowflake state without changing anything."""
-    ordered = _load_and_order(manifest_dir)
-    prof = load_profile(profile)
-    conn = connect(prof)
-    try:
-        client = CoreObjectClient(Root(conn))
-        plan_result = compute_plan(ordered, client)
+    plan_result = snowrig.plan(manifest_dir, profile=profile)
+    if not plan_result:
+        console.print(f"[yellow]No .yaml objects found under {manifest_dir}[/yellow]")
+        return
 
-        table = Table("Action", "Resource", "Object", "Changed fields")
-        for change in plan_result:
-            fields = ", ".join(change.diff.keys()) if change.diff else (change.error or "")
-            if change.is_destructive:
-                fields = f"[red]\u26a0 DESTRUCTIVE[/red] {fields} \u2014 {change.destructive_summary()}"
-            table.add_row(
-                _action_style(change.action), change.key.resource, change.key.qualified_name, fields
-            )
-        console.print(table)
-    finally:
-        conn.close()
+    table = Table("Action", "Resource", "Object", "Changed fields")
+    for change in plan_result:
+        fields = ", ".join(change.diff.keys()) if change.diff else (change.error or "")
+        if change.is_destructive:
+            fields = f"[red]⚠ DESTRUCTIVE[/red] {fields} — {change.destructive_summary()}"
+        table.add_row(
+            _action_style(change.action), change.key.resource, change.key.qualified_name, fields
+        )
+    console.print(table)
 
 
 @app.command()
@@ -174,39 +162,29 @@ def apply(
     ),
 ) -> None:
     """Apply a manifest to Snowflake, in dependency order."""
-    ordered = _load_and_order(manifest_dir)
-    prof = load_profile(profile)
-    conn = connect(prof)
-    try:
-        client = CoreObjectClient(Root(conn))
-        sql_runner = SqlRunner(conn)
-        plan_result = compute_plan(ordered, client)
+    results = snowrig.apply(
+        manifest_dir,
+        profile=profile,
+        dry_run=dry_run,
+        stop_on_error=not continue_on_error,
+        allow_destructive=allow_destructive,
+    )
 
-        actionable = [c for c in plan_result if c.action in (Action.CREATE, Action.UPDATE)]
-        if not actionable:
-            console.print("[dim]Nothing to do — live state already matches the manifest.[/dim]")
-            return
+    if not results:
+        console.print("[dim]Nothing to do — live state already matches the manifest.[/dim]")
+        return
 
-        console.print(f"Applying {len(actionable)} change(s){' (dry run)' if dry_run else ''}...")
-        results = apply_plan(
-            plan_result, client, sql_runner=sql_runner,
-            warehouse=prof.warehouse, role=prof.role,
-            dry_run=dry_run, stop_on_error=not continue_on_error,
-            allow_destructive=allow_destructive,
-        )
-
-        for change, error in results:
-            label = f"{change.key.resource}:{change.key.qualified_name}"
-            if change.blocked:
-                console.print(f"  [yellow]BLOCKED[/yellow]  {label} \u2014 {change.blocked}")
-            elif error:
-                console.print(f"  [red]FAILED[/red]  {label} \u2014 {error}")
-            elif dry_run:
-                console.print(f"  [dim]WOULD APPLY[/dim]  {label}")
-            else:
-                console.print(f"  [green]APPLIED[/green]  {label}")
-    finally:
-        conn.close()
+    console.print(f"Applied/attempted {len(results)} change(s){' (dry run)' if dry_run else ''}...")
+    for change, error in results:
+        label = f"{change.key.resource}:{change.key.qualified_name}"
+        if change.blocked:
+            console.print(f"  [yellow]BLOCKED[/yellow]  {label} — {change.blocked}")
+        elif error:
+            console.print(f"  [red]FAILED[/red]  {label} — {error}")
+        elif dry_run:
+            console.print(f"  [dim]WOULD APPLY[/dim]  {label}")
+        else:
+            console.print(f"  [green]APPLIED[/green]  {label}")
 
 
 @app.command()
