@@ -24,6 +24,7 @@ available here.
 
 from __future__ import annotations
 
+from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING
 
 from snowflake.core import Root
@@ -55,7 +56,12 @@ __all__ = [
     "DependencyError",
 ]
 
-__version__ = "0.1.0"
+try:
+    __version__ = version("snowrig")
+except PackageNotFoundError:
+    # Running from a source checkout without an installed/editable package
+    # (e.g. tests invoked via PYTHONPATH rather than `pip install -e .`).
+    __version__ = "0.0.0+unknown"
 
 
 def _open_connection(profile: str) -> tuple["SnowflakeConnection", str | None, str | None]:
