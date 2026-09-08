@@ -1,6 +1,6 @@
 [project]
 name = "snowrig"
-version = "0.2.0"
+version = "0.3.1"
 description = "Free, always-available Snowflake automation: a lightweight Python-native manifest/plan/apply layer built on Snowflake's own official SDKs (snowflake.core + the Snowflake Connector), not a hand-rolled REST client."
 readme = "README.md"
 requires-python = ">=3.10"
