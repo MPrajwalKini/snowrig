@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING
 from snowflake.core import Root
 
 from snowrig.config import load_profile
-from snowrig.connection import connect
+from snowrig.connection_bkp import connect
 from snowrig.manifest.diff import (
     Action,
     FieldDiff,
