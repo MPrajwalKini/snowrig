@@ -14,45 +14,47 @@ queries.
 Not a general-purpose API gateway: no query allowlisting, no per-caller
 row-level auth, no rate limiting. Put this behind your own gateway/proxy
 if you need those, rather than exposing --host 0.0.0.0 directly.
-"""
 
-from __future__ import annotations
+Deliberately NOT using `from __future__ import annotations` here: FastAPI
+resolves parameter type hints by looking them up in the function's
+*global* namespace at request-handling time. With postponed evaluation,
+every annotation becomes a string, and any type defined inside a
+function (a closure-local, not a global) can't be resolved back from
+that string — FastAPI silently falls back to treating the parameter as a
+plain query parameter instead of an injected Request or a parsed request
+body. That's why QueryRequest/TestRequest/Request are all defined here
+at module scope, with real (non-deferred) annotations.
+"""
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from snowrig.config import Profile, load_profiles_from_file
 from snowrig.connection import connect
 
+try:
+    from fastapi import FastAPI, HTTPException, Request
+    from pydantic import BaseModel
+except ImportError as e:  # pragma: no cover - exercised only without the extra
+    raise ImportError(
+        "snowrig serve needs the 'api' extra: pip install snowrig[api]"
+    ) from e
 
-def _unauthenticated_error(detail: str):
-    from fastapi import HTTPException
 
-    return HTTPException(status_code=401, detail=detail)
+class QueryRequest(BaseModel):
+    profile: str
+    sql: str
 
 
-def build_app(config_path: Path | None = None, token_env: str = "SNOWRIG_API_TOKEN"):
-    """Builds the FastAPI app. Raises ImportError with a clear message if
-    the `api` extra isn't installed."""
-    try:
-        from fastapi import FastAPI, HTTPException, Request
-        from pydantic import BaseModel
-    except ImportError as e:  # pragma: no cover - exercised only without the extra
-        raise ImportError(
-            "snowrig serve needs the 'api' extra: pip install snowrig[api]"
-        ) from e
+class TestRequest(BaseModel):
+    profile: str
 
+
+def build_app(config_path: Optional[Path] = None, token_env: str = "SNOWRIG_API_TOKEN") -> FastAPI:
     app = FastAPI(title="snowrig connection API", version="1.0")
-    profiles: dict[str, Profile] = load_profiles_from_file(config_path)
-    connections: dict[str, Any] = {}  # lazy per-profile connection cache
-
-    class QueryRequest(BaseModel):
-        profile: str
-        sql: str
-
-    class TestRequest(BaseModel):
-        profile: str
+    profiles: dict = load_profiles_from_file(config_path)
+    connections: dict = {}  # lazy per-profile connection cache
 
     def _authed(request: Request) -> None:
         expected = os.environ.get(token_env)
@@ -63,7 +65,7 @@ def build_app(config_path: Path | None = None, token_env: str = "SNOWRIG_API_TOK
             )
         got = request.headers.get("authorization", "")
         if got != f"Bearer {expected}":
-            raise _unauthenticated_error("missing or invalid bearer token")
+            raise HTTPException(status_code=401, detail="missing or invalid bearer token")
 
     def _get_connection(profile_name: str):
         if profile_name not in profiles:

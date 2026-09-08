@@ -218,6 +218,12 @@ def serve(
         console.print("[red]Missing the 'api' extra.[/red] Install with: pip install snowrig[api]")
         raise typer.Exit(1)
 
+    try:
+        from snowrig.api.server import build_app
+    except ImportError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+
     if not os.environ.get(token_env):
         console.print(
             f"[red]{token_env} is not set.[/red] Set it to a long random value before "
@@ -230,8 +236,6 @@ def serve(
             f"[yellow]Binding to {host} exposes this API beyond localhost.[/yellow] "
             f"Make sure something in front of it (network policy, reverse proxy) restricts access."
         )
-
-    from snowrig.api.server import build_app
 
     config_path = Path(config) if config else None
     fastapi_app = build_app(config_path=config_path, token_env=token_env)

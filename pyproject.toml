@@ -38,9 +38,6 @@ api = [
     "fastapi>=0.110",
     "uvicorn>=0.29",
 ]
-idmc = [
-    "requests>=2.31",
-]
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
