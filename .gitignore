@@ -4,3 +4,7 @@ __pycache__/
 *.egg-info/
 .snowrig/
 *.pem
+dist/
+build/
+.pytest_cache/
+.env
