@@ -57,8 +57,10 @@ class _FakeCursor:
         self.rowcount = rowcount
         self._raise_on_execute = raise_on_execute
         self.closed = False
+        self.executed_with_params: list[tuple] = []
 
-    def execute(self, sql):
+    def execute(self, sql, *args):
+        self.executed_with_params.append((sql, args))
         if self._raise_on_execute:
             raise self._raise_on_execute
         return self
@@ -192,7 +194,38 @@ def test_query_success_returns_columns_and_rows(client, monkeypatch):
     assert body["rowcount"] == 2
     assert cursor.closed is True  # cursor always closed, even on success
 
+def test_query_with_params_binds_them_natively(client, monkeypatch):
+    """A caller sending {"sql": "... WHERE id = %s", "params": [123]} must
+    have that value bound by the driver, not string-formatted into the SQL
+    — this is the whole point of /v1/query accepting params separately."""
+    cursor = _FakeCursor(description=[("NAME",)], rows=[("Alice",)], rowcount=1)
+    monkeypatch.setattr(server_module, "connect", lambda profile: _FakeConnection(cursor))
 
+    response = client.post(
+        "/v1/query",
+        json={"profile": "default", "sql": "SELECT name FROM customers WHERE id = %s", "params": [123]},
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    assert cursor.executed_with_params == [
+        ("SELECT name FROM customers WHERE id = %s", ([123],))
+    ]
+
+
+def test_query_without_params_field_still_works(client, monkeypatch):
+    """params is optional — omitting it entirely from the request body
+    (not even sending null) must behave exactly like today."""
+    cursor = _FakeCursor(description=[("X",)], rows=[(1,)], rowcount=1)
+    monkeypatch.setattr(server_module, "connect", lambda profile: _FakeConnection(cursor))
+
+    response = client.post(
+        "/v1/query", json={"profile": "default", "sql": "SELECT 1"}, headers=_auth_headers()
+    )
+
+    assert response.status_code == 200
+    assert cursor.executed_with_params == [("SELECT 1", ())]
+    
 def test_query_sql_error_returns_400_not_500(client, monkeypatch):
     cursor = _FakeCursor(raise_on_execute=RuntimeError("SQL compilation error: invalid identifier"))
     monkeypatch.setattr(server_module, "connect", lambda profile: _FakeConnection(cursor))

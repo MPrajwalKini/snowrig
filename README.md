@@ -175,7 +175,8 @@ GET  /v1/health           # no auth — for load balancer / uptime checks
 GET  /v1/profiles         # lists configured profile names + account/warehouse/role
                            # (never returns key material or passphrases)
 POST /v1/test-connection  # {"profile": "default"} -> {"ok": true|false, "error"?: "..."}
-POST /v1/query             # {"profile": "default", "sql": "SELECT ..."} -> {"columns", "rows", "rowcount"}
+POST /v1/query             # {"profile": "default", "sql": "SELECT ...", "params"?: [...]}
+                           # -> {"columns", "rows", "rowcount"}
 ```
 
 Every route except `/v1/health` requires `Authorization: Bearer <SNOWRIG_API_TOKEN>`.
@@ -186,6 +187,21 @@ curl -H "Authorization: Bearer $SNOWRIG_API_TOKEN" \
      -d '{"profile": "default", "sql": "SELECT CURRENT_VERSION()"}' \
      http://127.0.0.1:8420/v1/query
 ```
+
+`sql` accepts an optional `params` array alongside it for parameterized
+queries — the connector binds these natively rather than you
+string-formatting a value into `sql` yourself, which matters most exactly
+where this endpoint is most likely to be used: building a query from
+input a caller sent you.
+
+```bash
+curl -H "Authorization: Bearer $SNOWRIG_API_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"profile": "default", "sql": "SELECT * FROM customers WHERE id = %s", "params": [123]}' \
+     http://127.0.0.1:8420/v1/query
+```
+
+`params` is entirely optional — omit it for queries with no placeholders.
 
 **What this is not.** `/v1/query` runs whatever SQL the caller sends,
 with whatever privileges that profile's role has — DDL and DML included.

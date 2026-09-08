@@ -81,6 +81,39 @@ class SqlRunner:
         placeholders = ", ".join("%s" for _ in args) if args else ""
         return self._run_with_params(f"CALL {qualified_name}({placeholders})", args, **context)
 
+    def run_query(
+        self,
+        sql: str,
+        params: list[Any] | tuple[Any, ...] | None = None,
+        *,
+        database: str | None = None,
+        schema: str | None = None,
+        warehouse: str | None = None,
+        role: str | None = None,
+    ) -> tuple[list[str], list[tuple], int]:
+        """Like run(), but returns the cursor-shaped (columns, rows, rowcount)
+        instead of a list of dicts — for callers building their own tabular
+        response format (e.g. the `snowrig serve` HTTP API) rather than
+        wanting row objects. The cursor is always closed, even on error.
+
+        Pass `params` for a parameterized query (`SELECT * FROM t WHERE id = %s`,
+        params=[123]) — the connector binds these natively rather than you
+        string-formatting values into `sql` yourself, which matters most
+        exactly where this method is most likely to be used: building a
+        query from caller-supplied input (e.g. `snowrig serve`)."""
+        cur = self._conn.cursor()
+        try:
+            self._use_context(cur, database=database, schema=schema, warehouse=warehouse, role=role)
+            if params is not None:
+                cur.execute(sql, params)
+            else:
+                cur.execute(sql)
+            columns = [c[0] for c in cur.description] if cur.description else []
+            rows = cur.fetchall() if cur.description else []
+            return columns, rows, cur.rowcount
+        finally:
+            cur.close()
+
     def _run_with_params(
         self, sql: str, params: list[Any],
         *, database: str | None = None, schema: str | None = None,

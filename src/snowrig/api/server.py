@@ -32,6 +32,7 @@ from typing import Any, Optional
 
 from snowrig.config import Profile, load_profiles_from_file
 from snowrig.connection import connect
+from snowrig.sql import SqlRunner
 
 try:
     from fastapi import FastAPI, HTTPException, Request
@@ -45,6 +46,7 @@ except ImportError as e:  # pragma: no cover - exercised only without the extra
 class QueryRequest(BaseModel):
     profile: str
     sql: str
+    params: Optional[list] = None
 
 
 class TestRequest(BaseModel):
@@ -104,7 +106,7 @@ def build_app(config_path: Optional[Path] = None, token_env: str = "SNOWRIG_API_
             raise HTTPException(status_code=404, detail=f"unknown profile '{body.profile}'")
         try:
             conn = _get_connection(body.profile)
-            conn.cursor().execute("SELECT 1").fetchone()
+            SqlRunner(conn).run_query("SELECT 1")
             return {"ok": True}
         except Exception as e:
             connections.pop(body.profile, None)
@@ -114,15 +116,10 @@ def build_app(config_path: Optional[Path] = None, token_env: str = "SNOWRIG_API_
     def query(body: QueryRequest, request: Request) -> dict:
         _authed(request)
         conn = _get_connection(body.profile)
-        cur = conn.cursor()
         try:
-            cur.execute(body.sql)
-            columns = [c[0] for c in cur.description] if cur.description else []
-            rows = cur.fetchall() if cur.description else []
-            return {"columns": columns, "rows": rows, "rowcount": cur.rowcount}
+            columns, rows, rowcount = SqlRunner(conn).run_query(body.sql, body.params)
+            return {"columns": columns, "rows": rows, "rowcount": rowcount}
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
-        finally:
-            cur.close()
 
     return app
