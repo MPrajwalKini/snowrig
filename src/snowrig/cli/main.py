@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import typer
@@ -195,6 +196,47 @@ def resources() -> None:
     for name in sorted(RESOURCE_MODELS):
         console.print(f"  {name}")
     console.print("  [dim]procedure, function — via raw SQL (`sql:` in the manifest), not this list[/dim]")
+
+
+@app.command()
+def serve(
+    config: str = typer.Option(None, help="Path to config.yaml (defaults to ~/.snowrig/config.yaml)"),
+    host: str = typer.Option(
+        "127.0.0.1", help="Bind address. Only use 0.0.0.0 behind your own auth/network layer."
+    ),
+    port: int = typer.Option(8420),
+    token_env: str = typer.Option(
+        "SNOWRIG_API_TOKEN", help="Env var holding the bearer token every request must present"
+    ),
+) -> None:
+    """Serve a small REST API so other platforms can run SQL through a
+    named profile over plain HTTP, without ever holding the private key
+    themselves. Needs the 'api' extra: pip install snowrig[api]"""
+    try:
+        import uvicorn
+    except ImportError:
+        console.print("[red]Missing the 'api' extra.[/red] Install with: pip install snowrig[api]")
+        raise typer.Exit(1)
+
+    if not os.environ.get(token_env):
+        console.print(
+            f"[red]{token_env} is not set.[/red] Set it to a long random value before "
+            f"starting the server — every request must present it as a Bearer token."
+        )
+        raise typer.Exit(1)
+
+    if host not in ("127.0.0.1", "localhost"):
+        console.print(
+            f"[yellow]Binding to {host} exposes this API beyond localhost.[/yellow] "
+            f"Make sure something in front of it (network policy, reverse proxy) restricts access."
+        )
+
+    from snowrig.api.server import build_app
+
+    config_path = Path(config) if config else None
+    fastapi_app = build_app(config_path=config_path, token_env=token_env)
+    console.print(f"[green]Serving on http://{host}:{port}[/green] (Ctrl+C to stop)")
+    uvicorn.run(fastapi_app, host=host, port=port)
 
 
 if __name__ == "__main__":
