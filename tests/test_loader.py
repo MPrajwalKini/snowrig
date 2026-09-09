@@ -235,3 +235,18 @@ def test_yaml_and_yml_extensions_both_load_but_are_not_interleaved_in_sort_order
     objects = load_manifest_dir(tmp_path)
 
     assert [o.path_params["name"] for o in objects] == ["B", "A"]
+
+def test_path_params_must_be_a_mapping_not_a_list(tmp_path):
+    """A malformed manifest with path_params as a list (not a mapping)
+    must raise ManifestError, not an unrelated AttributeError from
+    calling .items() on a list. Caught live via a smoke test."""
+    _write(
+        tmp_path / "malformed.yaml",
+        """
+        resource: table
+        path_params: [this, is, not, a, mapping]
+        """,
+    )
+
+    with pytest.raises(ManifestError, match="path_params"):
+        load_manifest_dir(tmp_path)

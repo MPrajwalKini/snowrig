@@ -40,6 +40,11 @@ def _load_one(path: Path) -> ManifestObject:
         raise ManifestError(f"{path}: missing required key 'resource'")
     if "path_params" not in doc:
         raise ManifestError(f"{path}: missing required key 'path_params'")
+    if not isinstance(doc["path_params"], dict):
+        raise ManifestError(
+            f"{path}: 'path_params' must be a mapping of key: value pairs "
+            f"(e.g. database: DB), got {type(doc['path_params']).__name__}"
+        )
 
     return ManifestObject(
         resource=doc["resource"],

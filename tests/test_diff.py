@@ -241,3 +241,137 @@ def test_dry_run_reports_without_applying():
     [(change, error)] = results
     assert error is None
     assert client.applied == []
+
+# --------------------------------------------------------------------- #
+# Regression tests: bugs found via live smoke testing (see CHANGELOG)
+# --------------------------------------------------------------------- #
+
+def test_nested_dict_field_diffs_as_declared_subset():
+    """A single nested-object field (e.g. Stream.stream_source) should only
+    diff on the keys the manifest declared, not server-computed extras
+    fetch() returns alongside them. Caught live: a stream showed as
+    perpetually changed because live stream_source carried database_name/
+    schema_name/append_only/src_type that the manifest never declared."""
+    obj = ManifestObject(
+        resource="stream",
+        path_params={"database": "DB", "schema": "PUBLIC", "name": "MY_STREAM"},
+        body={"stream_source": {"name": "CUSTOMERS"}},
+    )
+    client = FakeCoreObjectClient(live={
+        ("stream", "MY_STREAM"): {
+            "stream_source": {
+                "name": "CUSTOMERS",
+                "database_name": "DB",
+                "schema_name": "PUBLIC",
+                "append_only": False,
+                "src_type": "table",
+            },
+        },
+    })
+
+    [change] = compute_plan([obj], client)
+
+    assert change.action == Action.NOOP, change.diff
+
+
+def test_nested_dict_field_still_detects_real_change():
+    """The subset comparison shouldn't become a rubber stamp — a genuine
+    change to a declared key inside a nested dict must still be caught."""
+    obj = ManifestObject(
+        resource="stream",
+        path_params={"database": "DB", "schema": "PUBLIC", "name": "MY_STREAM"},
+        body={"stream_source": {"name": "CUSTOMERS"}},
+    )
+    client = FakeCoreObjectClient(live={
+        ("stream", "MY_STREAM"): {"stream_source": {"name": "ORDERS", "database_name": "DB"}},
+    })
+
+    [change] = compute_plan([obj], client)
+
+    assert change.action == Action.UPDATE
+    assert "stream_source" in change.diff
+
+
+def test_column_datatype_normalizes_number_shorthand():
+    """Snowflake's fetch() always returns fully-qualified NUMBER(38,0),
+    VARCHAR(16777216), etc. A manifest using the short form (NUMBER,
+    VARCHAR) must not diff as changed forever. Caught live: plan()
+    reported a phantom UPDATE on every single run for any table using
+    shorthand types."""
+    obj = _table("CUSTOMERS", [{"name": "ID", "datatype": "NUMBER"}])
+    client = FakeCoreObjectClient(live={
+        ("table", "CUSTOMERS"): {"columns": [{"name": "ID", "datatype": "NUMBER(38,0)"}]},
+    })
+
+    [change] = compute_plan([obj], client)
+
+    assert change.action == Action.NOOP, change.diff
+
+
+def test_column_datatype_still_detects_real_type_change():
+    obj = _table("CUSTOMERS", [{"name": "ID", "datatype": "VARCHAR(50)"}])
+    client = FakeCoreObjectClient(live={
+        ("table", "CUSTOMERS"): {"columns": [{"name": "ID", "datatype": "NUMBER(38,0)"}]},
+    })
+
+    [change] = compute_plan([obj], client)
+
+    assert change.action == Action.UPDATE
+    assert "columns" in change.diff
+
+
+def test_view_query_ignores_ddl_wrapper():
+    """fetch() returns a view's `query` as the full CREATE VIEW ... AS
+    <select> DDL text, not just the SELECT. Comparing that raw against the
+    manifest's bare query would make every view diff as changed forever —
+    caught live against a real account."""
+    obj = ManifestObject(
+        resource="view",
+        path_params={"database": "DB", "schema": "PUBLIC", "name": "MY_VIEW"},
+        body={"query": "SELECT ID FROM DB.PUBLIC.CUSTOMERS"},
+    )
+    client = FakeCoreObjectClient(live={
+        ("view", "MY_VIEW"): {
+            "query": "CREATE  OR REPLACE     VIEW  DB.PUBLIC.MY_VIEW  (  ID  )  AS SELECT ID FROM DB.PUBLIC.CUSTOMERS",
+        },
+    })
+
+    [change] = compute_plan([obj], client)
+
+    assert change.action == Action.NOOP, change.diff
+
+
+def test_view_query_still_detects_real_change():
+    obj = ManifestObject(
+        resource="view",
+        path_params={"database": "DB", "schema": "PUBLIC", "name": "MY_VIEW"},
+        body={"query": "SELECT ID, EMAIL FROM DB.PUBLIC.CUSTOMERS"},
+    )
+    client = FakeCoreObjectClient(live={
+        ("view", "MY_VIEW"): {
+            "query": "CREATE OR REPLACE VIEW DB.PUBLIC.MY_VIEW (ID) AS SELECT ID FROM DB.PUBLIC.CUSTOMERS",
+        },
+    })
+
+    [change] = compute_plan([obj], client)
+
+    assert change.action == Action.UPDATE
+    assert "query" in change.diff
+
+
+def test_query_field_not_ddl_normalized_for_non_view_resources():
+    """The view-DDL unwrapping is specific to `view` — a dynamic-table's
+    `query` (or any other resource's) should compare literally, not get
+    the same AS-stripping treatment."""
+    obj = ManifestObject(
+        resource="dynamic-table",
+        path_params={"database": "DB", "schema": "PUBLIC", "name": "MY_DT"},
+        body={"query": "SELECT ID FROM DB.PUBLIC.CUSTOMERS"},
+    )
+    client = FakeCoreObjectClient(live={
+        ("dynamic-table", "MY_DT"): {"query": "SELECT ID FROM DB.PUBLIC.CUSTOMERS"},
+    })
+
+    [change] = compute_plan([obj], client)
+
+    assert change.action == Action.NOOP, change.diff

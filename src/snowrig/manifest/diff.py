@@ -23,6 +23,7 @@ this is safe, just less informative than a real field diff.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -98,7 +99,11 @@ def _diff_list_field(live_value: Any, desired_value: list[dict[str, Any]]) -> Fi
             changed = True  # new item — additive, not destructive
             continue
         for k, v in desired_item.items():
-            if str(live_item.get(k)).lower() != str(v).lower():
+            live_v = live_item.get(k)
+            if k == "datatype":
+                if _normalize_type(live_v) != _normalize_type(v):
+                    changed = True
+            elif not _values_match(live_v, v):
                 changed = True
 
     if not removed and not changed:
@@ -106,12 +111,73 @@ def _diff_list_field(live_value: Any, desired_value: list[dict[str, Any]]) -> Fi
     return FieldDiff(live=live_value, desired=desired_value, removed_items=removed)
 
 
+# Base Snowflake type names mapped to the canonical form `fetch()` returns
+# them as, so a manifest can write the short form without permanently
+# diffing against Snowflake's fully-qualified precision/scale/length.
+# Best-effort, not exhaustive — extend as new mismatches surface.
+_TYPE_CANONICAL = {
+    "NUMBER": "NUMBER(38,0)",
+    "DECIMAL": "NUMBER(38,0)",
+    "NUMERIC": "NUMBER(38,0)",
+    "INT": "NUMBER(38,0)",
+    "INTEGER": "NUMBER(38,0)",
+    "BIGINT": "NUMBER(38,0)",
+    "SMALLINT": "NUMBER(38,0)",
+    "TINYINT": "NUMBER(38,0)",
+    "BYTEINT": "NUMBER(38,0)",
+    "VARCHAR": "VARCHAR(16777216)",
+    "STRING": "VARCHAR(16777216)",
+    "TEXT": "VARCHAR(16777216)",
+    "CHAR": "VARCHAR(1)",
+    "CHARACTER": "VARCHAR(1)",
+}
+
+
+def _normalize_type(t: Any) -> str:
+    """Canonicalizes a Snowflake column datatype string for comparison —
+    e.g. 'NUMBER' and 'NUMBER(38,0)' are the same type to Snowflake, but
+    fetch() always returns the fully-qualified form, so a manifest using
+    the short form would otherwise diff as changed on every plan/apply."""
+    s = str(t).strip().upper()
+    return _TYPE_CANONICAL.get(s, s)
+
+
 def _values_match(live_value: Any, desired_value: Any) -> bool:
-    """Loose equality for scalar/non-list fields."""
+    """Loose equality for scalar/non-list fields. A dict compares as a
+    declared subset — recursively — so a nested object field (e.g.
+    Stream.stream_source) only diffs on the keys the manifest actually
+    declared, not server-computed extras fetch() returns alongside them."""
+    if isinstance(desired_value, dict):
+        if not isinstance(live_value, dict):
+            return False
+        return all(_values_match(live_value.get(k), v) for k, v in desired_value.items())
     return str(live_value).lower() == str(desired_value).lower()
 
 
-def _diff_fields(live: dict[str, Any], desired: dict[str, Any]) -> dict[str, FieldDiff]:
+def _normalize_whitespace(s: str) -> str:
+    return " ".join(s.split())
+
+
+# Matches up through the first top-level "AS" that follows "VIEW" in the
+# DDL text fetch() returns for a view — i.e. the boundary between the
+# "CREATE [OR REPLACE] VIEW <name> [(col, ...)]" header and the actual
+# query. Non-greedy so it stops at that first AS rather than one inside
+# the query body itself.
+_VIEW_DDL_HEADER_RE = re.compile(r"\bVIEW\b.*?\bAS\b\s*", re.IGNORECASE | re.DOTALL)
+
+
+def _extract_view_query(live_ddl: str) -> str:
+    """fetch() returns a view's `query` field as the full CREATE VIEW DDL
+    text, not just the SELECT — extract everything after the header so it
+    can be compared against the manifest's bare query. Falls back to the
+    raw string if the expected header shape isn't found."""
+    match = _VIEW_DDL_HEADER_RE.search(live_ddl)
+    if not match:
+        return live_ddl.strip()
+    return live_ddl[match.end():].strip()
+
+
+def _diff_fields(live: dict[str, Any], desired: dict[str, Any], resource: str | None = None) -> dict[str, FieldDiff]:
     changes: dict[str, FieldDiff] = {}
     for field_name, desired_value in desired.items():
         live_value = live.get(field_name)
@@ -120,6 +186,13 @@ def _diff_fields(live: dict[str, Any], desired: dict[str, Any]) -> dict[str, Fie
             list_diff = _diff_list_field(live_value, desired_value)
             if list_diff is not None:
                 changes[field_name] = list_diff
+            continue
+
+        if resource == "view" and field_name == "query" and isinstance(live_value, str) and isinstance(desired_value, str):
+            live_cmp = _normalize_whitespace(_extract_view_query(live_value))
+            desired_cmp = _normalize_whitespace(desired_value)
+            if live_cmp.lower() != desired_cmp.lower():
+                changes[field_name] = FieldDiff(live=live_value, desired=desired_value)
             continue
 
         if not _values_match(live_value, desired_value):
@@ -155,7 +228,7 @@ def compute_plan(
             )
             continue
 
-        diff = _diff_fields(live, obj.body)
+        diff = _diff_fields(live, obj.body, resource=obj.resource)
         action = Action.UPDATE if diff else Action.NOOP
         plan.append(PlannedChange(obj=obj, key=key, action=action, diff=diff))
 
