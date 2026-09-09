@@ -1,0 +1,7 @@
+resource: event-table
+path_params:
+  database: SNOWRIG_DEMO
+  schema: PUBLIC
+  name: APP_EVENTS
+body:
+  comment: "Event table target for application logging."

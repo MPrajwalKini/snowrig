@@ -1,0 +1,15 @@
+resource: dynamic-table
+path_params:
+  database: SNOWRIG_DEMO
+  schema: PUBLIC
+  name: CUSTOMERS_SUMMARY
+body:
+  # target_lag is a concrete (non-discriminated) nested model, so a plain
+  # dict auto-coerces fine here — no _BODY_COERCERS entry needed, unlike
+  # Stream.stream_source. See CONTRIBUTING.md.
+  target_lag:
+    seconds: 60
+  warehouse: COMPUTE_WH
+  query: "SELECT ID, EMAIL FROM CUSTOMERS"
+depends_on:
+  - "table:SNOWRIG_DEMO.PUBLIC.CUSTOMERS"

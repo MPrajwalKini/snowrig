@@ -1,0 +1,7 @@
+resource: stage
+path_params:
+  database: SNOWRIG_DEMO
+  schema: PUBLIC
+  name: RAW_FILES
+body:
+  comment: "Internal stage for landing raw files before loading."

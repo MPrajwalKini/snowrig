@@ -1,0 +1,11 @@
+resource: pipe
+path_params:
+  database: SNOWRIG_DEMO
+  schema: PUBLIC
+  name: CUSTOMER_INGEST
+body:
+  copy_statement: "COPY INTO CUSTOMERS FROM @RAW_FILES FILE_FORMAT = (TYPE = CSV)"
+  comment: "Auto-ingest pipe for files landing in RAW_FILES."
+depends_on:
+  - "table:SNOWRIG_DEMO.PUBLIC.CUSTOMERS"
+  - "stage:SNOWRIG_DEMO.PUBLIC.RAW_FILES"

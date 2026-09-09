@@ -6,7 +6,28 @@ follows [semver](https://semver.org/).
 
 ## [Unreleased]
 
-Local changes since the `0.3.1` upload — not yet published.
+Local changes since the `0.3.2` upload — not yet published.
+
+### Added
+- `snowrig.Session` / `snowrig.session()` — holds one connection open
+  across multiple `plan()`/`apply()`/`query()` calls instead of opening a
+  fresh one per call. `plan()`/`apply()` are now thin one-call wrappers
+  around a `Session` opened and closed for that single call; their
+  observable behavior is unchanged (verified: all existing connection-
+  lifecycle tests pass without modification).
+- 5 new resource types: `dynamic-table`, `event-table`, `pipe`,
+  `sequence`, `stage` — bringing total coverage to 12. These were already
+  anticipated in `manifest/schema.py`'s `SCHEMA_SCOPED_RESOURCES` but
+  never wired up in `core_registry.py` until now. Example manifests added
+  for all 5 under `examples/manifests/`.
+- `tests/test_session.py` (11 tests) and `tests/test_core_registry.py`
+  (26 tests) — first direct coverage of either.
+
+### Notes
+- Deliberately still excludes grants/roles/users from resource coverage
+  — see `core_registry.py`'s module docstring for why.
+
+## [0.3.2] — TestPyPI
 
 ### Added
 - `SqlRunner.run_query()` — returns cursor-shaped `(columns, rows,
@@ -24,7 +45,7 @@ Local changes since the `0.3.1` upload — not yet published.
 - `SqlRunner.run()` briefly regressed to a `NameError` (`params` referenced
   before it existed as a parameter) during the `run_query()` refactor —
   caught via the test suite and live `snowrig serve` testing before being
-  published anywhere.
+  published.
 
 ## [0.3.1] — TestPyPI
 

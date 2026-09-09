@@ -279,14 +279,15 @@ Working: key-pair auth via the official connector (with the private key
 resolvable from a file, an env var indirection, or raw content — see
 above, not just a local path), `snowrig exec`, `snowrig transaction`,
 `snowrig fetch`, `snowrig plan`, `snowrig apply` (with a destructive-
-change gate — see above), `snowrig serve` (an HTTP API for running SQL
-from platforms without a Snowflake driver or key material of their own —
-see above), dependency-ordered manifest deployment, explicit coercion for
-the handful of non-JSON-primitive fields that need it (`Task.schedule`,
-`Stream.stream_source` — see CONTRIBUTING.md), a public `plan()`/`apply()`
-library API for embedding in your own scripts/pipelines, and a pytest
-suite covering the diff engine, dependency graph, manifest loader, field
-coercion, credential resolution, the public API's connection-lifecycle
+change gate — see above), `snowrig serve` (an HTTP API for running SQL,
+with optional parameterized queries, from platforms without a Snowflake
+driver or key material of their own — see above), dependency-ordered
+manifest deployment, explicit coercion for the handful of non-JSON-primitive
+fields that need it (`Task.schedule`, `Stream.stream_source` — see
+CONTRIBUTING.md), a public `plan()`/`apply()` library API for embedding
+in your own scripts/pipelines, and a pytest suite covering the diff
+engine, dependency graph, manifest loader, field coercion, credential
+resolution, SQL execution, the public API's connection-lifecycle
 handling, and the `serve` API's auth/routing.
 
 Not yet built: broader resource coverage (`snowflake.core` supports far

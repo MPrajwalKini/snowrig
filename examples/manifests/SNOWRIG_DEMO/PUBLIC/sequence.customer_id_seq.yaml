@@ -1,0 +1,9 @@
+resource: sequence
+path_params:
+  database: SNOWRIG_DEMO
+  schema: PUBLIC
+  name: CUSTOMER_ID_SEQ
+body:
+  start: 1
+  increment: 1
+  comment: "Surrogate key generator for CUSTOMERS."
