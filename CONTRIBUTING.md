@@ -83,13 +83,37 @@ takes the raw body dict and returns one safe to pass into
 YAML→arbitrary-Python-object coercer; the goal is covering the handful of
 fields that actually need it, not solving deserialization in general.
 
+## Testing
+
+There's a pytest suite under `tests/` — no live Snowflake connection
+needed anywhere in it; everything runs against fakes/doubles. `pip install
+-e ".[dev,api]"` then `pytest tests/ -v`.
+
+If you're adding a new field coercer (see above), follow the pattern in
+`tests/test_core_client.py` — test the coercer function directly against
+the real `snowflake.core` model classes (`Cron`, `StreamSourceTable`,
+etc.) rather than mocking them, since the whole point is catching a real
+validation break, and mocking the thing you're validating against defeats
+that.
+
+If you're adding a new private-key/credential source (see
+`config.py`'s `Profile`), follow `tests/test_config.py` — cover the
+"exactly one source" validation, the "referenced env var doesn't exist"
+failure, and the successful resolution path.
+
+If you're touching `api/server.py`, follow `tests/test_api_server.py` —
+in particular, any change to `/v1/profiles` needs a test asserting the
+response does **not** contain key material or passphrases (see
+`test_profiles_lists_names_without_key_material`); that's the one thing
+that endpoint must never regress on.
+
 ## Other known gaps (see README "Status")
 
 - Grants/roles support
 - OAuth as an auth option
-- Tests
-- CI
-- PyPI packaging
+- Real PyPI (currently only published to TestPyPI)
+- Query allowlisting/rate limiting on `snowrig serve` (deliberately out
+  of scope for now, not a gap to fill — see the README's `serve` section)
 
 ## General guidelines
 
