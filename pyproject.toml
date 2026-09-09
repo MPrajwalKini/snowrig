@@ -33,6 +33,7 @@ snowrig = "snowrig.cli.main:app"
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    "httpx>=0.27",
 ]
 api = [
     "fastapi>=0.110",
