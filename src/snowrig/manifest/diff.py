@@ -23,6 +23,7 @@ this is safe, just less informative than a real field diff.
 
 from __future__ import annotations
 
+import difflib
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -49,10 +50,73 @@ class FieldDiff:
     # Names of list-items present live but absent from the manifest for
     # this field (e.g. dropped columns). Empty for non-destructive changes.
     removed_items: list[str] = field(default_factory=list)
+    # Names of list-items present in the manifest but not live yet (e.g. a
+    # new column being added alongside existing ones on an UPDATE).
+    added_items: list[str] = field(default_factory=list)
+    # item name -> {subfield_name: (live_value, desired_value)}, for items
+    # present on both sides but with one or more sub-fields differing
+    # (e.g. a column whose datatype changed).
+    changed_items: dict[str, dict[str, tuple[Any, Any]]] = field(default_factory=dict)
 
     @property
     def is_destructive(self) -> bool:
         return bool(self.removed_items)
+
+    def render(self) -> str:
+        """Human-readable summary of this field's change. Three shapes,
+        chosen by what the field actually is:
+          - list-of-dict fields (columns): git-style '+ NAME TYPE' /
+            '- NAME TYPE' / '~ NAME (sub: old -> new)', one entry per item.
+          - multi-line string fields (a view's query, or anything else
+            long enough to need it): a unified diff with a couple lines
+            of context around each change, same idea as `git diff` or a
+            Notepad++ compare — not the whole text dumped twice.
+          - everything else (short scalars): a plain 'old -> new' line.
+        """
+        if not (self.added_items or self.removed_items or self.changed_items):
+            if isinstance(self.live, str) and isinstance(self.desired, str) and self.live != self.desired:
+                text_diff = _unified_text_diff(self.live, self.desired)
+                if text_diff is not None:
+                    return text_diff
+            return f"{self.live!r} -> {self.desired!r}"
+
+        def _find(items: Any, name: str) -> dict[str, Any]:
+            if isinstance(items, list):
+                for item in items:
+                    if isinstance(item, dict) and item.get("name") == name:
+                        return item
+            return {}
+
+        lines: list[str] = []
+        for name in self.added_items:
+            item = _find(self.desired, name)
+            detail = item.get("datatype", "")
+            lines.append(f"+ {name}{f' {detail}' if detail else ''}")
+        for name in self.removed_items:
+            item = _find(self.live, name)
+            detail = item.get("datatype", "")
+            lines.append(f"- {name}{f' {detail}' if detail else ''}")
+        for name, subfields in self.changed_items.items():
+            detail = ", ".join(f"{k}: {old} -> {new}" for k, (old, new) in subfields.items())
+            lines.append(f"~ {name} ({detail})")
+        return "; ".join(lines)
+
+
+def _unified_text_diff(live: str, desired: str, context: int = 2) -> str | None:
+    """A Notepad++/git-style line-level diff with `context` lines of
+    unchanged surrounding text on either side of each change, rather than
+    dumping the entire old and new text. Returns None if the text isn't
+    multi-line — a single-line scalar reads better as a plain
+    'old -> new' line, which is what the caller falls back to."""
+    if "\n" not in live and "\n" not in desired:
+        return None
+    live_lines = live.splitlines()
+    desired_lines = desired.splitlines()
+    hunks = list(difflib.unified_diff(live_lines, desired_lines, lineterm="", n=context))
+    # Drop the '--- '/'+++ ' filename header lines difflib always emits
+    # first — meaningless here since there's no real file on either side.
+    body = [ln for ln in hunks if not (ln.startswith("--- ") or ln.startswith("+++ "))]
+    return "\n".join(body) if body else None
 
 
 @dataclass
@@ -91,24 +155,30 @@ def _diff_list_field(live_value: Any, desired_value: list[dict[str, Any]]) -> Fi
     }
 
     removed: list[str] = [name for name in live_by_name if name not in desired_by_name]
+    added: list[str] = [name for name in desired_by_name if name not in live_by_name]
 
-    changed = False
+    changed_items: dict[str, dict[str, tuple[Any, Any]]] = {}
     for name, desired_item in desired_by_name.items():
         live_item = live_by_name.get(name)
         if live_item is None:
-            changed = True  # new item — additive, not destructive
-            continue
+            continue  # captured in `added` above
+        item_changes: dict[str, tuple[Any, Any]] = {}
         for k, v in desired_item.items():
             live_v = live_item.get(k)
             if k == "datatype":
                 if _normalize_type(live_v) != _normalize_type(v):
-                    changed = True
+                    item_changes[k] = (live_v, v)
             elif not _values_match(live_v, v):
-                changed = True
+                item_changes[k] = (live_v, v)
+        if item_changes:
+            changed_items[name] = item_changes
 
-    if not removed and not changed:
+    if not removed and not added and not changed_items:
         return None
-    return FieldDiff(live=live_value, desired=desired_value, removed_items=removed)
+    return FieldDiff(
+        live=live_value, desired=desired_value,
+        removed_items=removed, added_items=added, changed_items=changed_items,
+    )
 
 
 # Base Snowflake type names mapped to the canonical form `fetch()` returns
@@ -189,10 +259,11 @@ def _diff_fields(live: dict[str, Any], desired: dict[str, Any], resource: str | 
             continue
 
         if resource == "view" and field_name == "query" and isinstance(live_value, str) and isinstance(desired_value, str):
-            live_cmp = _normalize_whitespace(_extract_view_query(live_value))
+            live_extracted = _extract_view_query(live_value)
+            live_cmp = _normalize_whitespace(live_extracted)
             desired_cmp = _normalize_whitespace(desired_value)
             if live_cmp.lower() != desired_cmp.lower():
-                changes[field_name] = FieldDiff(live=live_value, desired=desired_value)
+                changes[field_name] = FieldDiff(live=live_extracted, desired=desired_value)
             continue
 
         if not _values_match(live_value, desired_value):

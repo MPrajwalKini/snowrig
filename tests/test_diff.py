@@ -375,3 +375,101 @@ def test_query_field_not_ddl_normalized_for_non_view_resources():
     [change] = compute_plan([obj], client)
 
     assert change.action == Action.NOOP, change.diff
+
+
+# --------------------------------------------------------------------- #
+# Column-level +/-/~ diff rendering
+# --------------------------------------------------------------------- #
+
+def test_render_shows_added_and_removed_columns():
+    obj = _table("CUSTOMERS", [
+        {"name": "ID", "datatype": "NUMBER(38,0)"},
+        {"name": "EMAIL", "datatype": "VARCHAR(255)"},
+    ])
+    client = FakeCoreObjectClient(live={
+        ("table", "CUSTOMERS"): {"columns": [
+            {"name": "ID", "datatype": "NUMBER(38,0)"},
+            {"name": "OLD_COL", "datatype": "VARCHAR(50)"},
+        ]},
+    })
+
+    [change] = compute_plan([obj], client)
+    rendered = change.diff["columns"].render()
+
+    assert "+ EMAIL VARCHAR(255)" in rendered
+    assert "- OLD_COL VARCHAR(50)" in rendered
+
+
+def test_render_shows_changed_column_datatype():
+    obj = _table("CUSTOMERS", [{"name": "AMOUNT", "datatype": "VARCHAR(50)"}])
+    client = FakeCoreObjectClient(live={
+        ("table", "CUSTOMERS"): {"columns": [{"name": "AMOUNT", "datatype": "NUMBER(38,0)"}]},
+    })
+
+    [change] = compute_plan([obj], client)
+    rendered = change.diff["columns"].render()
+
+    assert rendered == "~ AMOUNT (datatype: NUMBER(38,0) -> VARCHAR(50))"
+
+
+def test_render_falls_back_to_plain_line_for_scalar_fields():
+    obj = ManifestObject(
+        resource="warehouse",
+        path_params={"name": "ETL_WH"},
+        body={"warehouse_size": "MEDIUM"},
+    )
+    client = FakeCoreObjectClient(live={("warehouse", "ETL_WH"): {"warehouse_size": "SMALL"}})
+
+    [change] = compute_plan([obj], client)
+    rendered = change.diff["warehouse_size"].render()
+
+    assert rendered == "'SMALL' -> 'MEDIUM'"
+
+
+# --------------------------------------------------------------------- #
+# Unified-diff (context-line) rendering for multi-line text fields
+# --------------------------------------------------------------------- #
+
+def test_render_multiline_field_shows_unified_diff_with_context():
+    """A multi-line text field (e.g. a view's normalized query) should
+    render as a line-level diff with a couple lines of context around
+    each change — a Notepad++/git-style compare — not the whole old and
+    new text dumped side by side."""
+    live_query = "SELECT\n  ID,\n  NAME,\n  EMAIL,\n  CREATED_AT\nFROM CUSTOMERS"
+    desired_query = "SELECT\n  ID,\n  NAME,\n  PHONE,\n  CREATED_AT\nFROM CUSTOMERS"
+
+    obj = ManifestObject(
+        resource="view",
+        path_params={"database": "DB", "schema": "PUBLIC", "name": "MY_VIEW"},
+        body={"query": desired_query},
+    )
+    client = FakeCoreObjectClient(live={
+        ("view", "MY_VIEW"): {"query": f"CREATE OR REPLACE VIEW DB.PUBLIC.MY_VIEW AS {live_query}"},
+    })
+
+    [change] = compute_plan([obj], client)
+    rendered = change.diff["query"].render()
+
+    assert "\n" in rendered, "expected a multi-line unified diff, not a single old->new line"
+    assert "-  EMAIL," in rendered
+    assert "+  PHONE," in rendered
+    # Context lines (unchanged) should still be present around the change
+    assert "NAME," in rendered
+    assert "CREATED_AT" in rendered
+    # difflib's filename headers aren't meaningful here and should be stripped
+    assert "--- " not in rendered
+    assert "+++ " not in rendered
+
+
+def test_render_single_line_string_field_does_not_use_unified_diff():
+    """A short, single-line scalar (no newlines on either side) should
+    stay a plain 'old -> new' line — a unified diff adds noise (hunk
+    headers, etc.) for a one-line value with nothing to give context on."""
+    obj = ManifestObject(resource="warehouse", path_params={"name": "WH"}, body={"warehouse_size": "MEDIUM"})
+    client = FakeCoreObjectClient(live={("warehouse", "WH"): {"warehouse_size": "SMALL"}})
+
+    [change] = compute_plan([obj], client)
+    rendered = change.diff["warehouse_size"].render()
+
+    assert rendered == "'SMALL' -> 'MEDIUM'"
+    assert "@@" not in rendered

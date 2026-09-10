@@ -117,11 +117,23 @@ def fetch(
 
 def _action_style(action: Action) -> str:
     return {
-        Action.CREATE: "[green]create[/green]",
-        Action.UPDATE: "[yellow]update[/yellow]",
-        Action.NOOP: "[dim]no-op[/dim]",
-        Action.ERROR: "[red]error[/red]",
+        Action.CREATE: "[green]+ create[/green]",
+        Action.UPDATE: "[yellow]~ update[/yellow]",
+        Action.NOOP: "[dim]  no-op[/dim]",
+        Action.ERROR: "[red]! error[/red]",
     }[action]
+
+
+def _color_diff_line(line: str) -> str:
+    """Applies Terraform-style coloring to one rendered diff line: green for
+    an addition, red for a removal, yellow for an in-place change."""
+    if line.startswith("+ "):
+        return f"[green]{line}[/green]"
+    if line.startswith("- "):
+        return f"[red]{line}[/red]"
+    if line.startswith("~ "):
+        return f"[yellow]{line}[/yellow]"
+    return line
 
 
 @app.command()
@@ -137,13 +149,38 @@ def plan(
 
     table = Table("Action", "Resource", "Object", "Changed fields")
     for change in plan_result:
-        fields = ", ".join(change.diff.keys()) if change.diff else (change.error or "")
+        if change.diff:
+            lines = []
+            for fname, d in change.diff.items():
+                if fname == "sql":
+                    lines.append("sql: will be (re-)applied")
+                    continue
+                rendered = d.render()
+                if any(rendered.startswith(p) for p in ("+ ", "- ", "~ ")):
+                    lines.append(f"{fname}:")
+                    lines.extend(f"  {_color_diff_line(part)}" for part in rendered.split("; "))
+                else:
+                    lines.append(f"{fname}: {rendered}")
+            fields = "\n".join(lines)
+        else:
+            fields = change.error or ""
         if change.is_destructive:
-            fields = f"[red]⚠ DESTRUCTIVE[/red] {fields} — {change.destructive_summary()}"
+            fields = f"[red]⚠ DESTRUCTIVE[/red]\n{fields}" if fields else "[red]⚠ DESTRUCTIVE[/red]"
         table.add_row(
             _action_style(change.action), change.key.resource, change.key.qualified_name, fields
         )
     console.print(table)
+
+    n_create = sum(1 for c in plan_result if c.action == Action.CREATE)
+    n_update = sum(1 for c in plan_result if c.action == Action.UPDATE)
+    n_destructive = sum(1 for c in plan_result if c.is_destructive)
+    n_error = sum(1 for c in plan_result if c.action == Action.ERROR)
+    summary = f"Plan: [green]{n_create} to add[/green], [yellow]{n_update} to change[/yellow]"
+    if n_destructive:
+        summary += f", [red]{n_destructive} destructive (blocked without --allow-destructive)[/red]"
+    if n_error:
+        summary += f", [red]{n_error} error(s)[/red]"
+    console.print(summary + ".")
 
 
 @app.command()
