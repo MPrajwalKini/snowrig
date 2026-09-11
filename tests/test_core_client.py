@@ -394,7 +394,13 @@ def test_create_or_alter_reorders_new_table_columns_to_the_end():
     client.create_or_alter(
         "table",
         {"database": "DB", "schema": "PUBLIC", "name": "T"},
-        {"columns": [{"name": "A"}, {"name": "NEW"}, {"name": "C"}]},  # B dropped, NEW mid-list
+        {
+            "columns": [
+                {"name": "A", "datatype": "VARCHAR(50)"},
+                {"name": "NEW", "datatype": "VARCHAR(20)"},  # B dropped, NEW mid-list
+                {"name": "C", "datatype": "VARCHAR(50)"},
+            ]
+        },
     )
 
     [model] = item.create_or_alter_calls
@@ -413,7 +419,12 @@ def test_create_or_alter_skips_reorder_for_a_brand_new_table():
     client.create_or_alter(
         "table",
         {"database": "DB", "schema": "PUBLIC", "name": "T"},
-        {"columns": [{"name": "B"}, {"name": "A"}]},
+        {
+            "columns": [
+                {"name": "B", "datatype": "VARCHAR(50)"},
+                {"name": "A", "datatype": "VARCHAR(50)"},
+            ]
+        },
     )
 
     [model] = item.create_or_alter_calls
