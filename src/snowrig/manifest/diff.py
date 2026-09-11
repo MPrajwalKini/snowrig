@@ -4,7 +4,10 @@ is deliberately a shallow, key-subset comparison rather than a full
 semantic diff — snowflake.core's fetched models include many server-
 computed fields (timestamps, owner, clustering stats, etc.) that aren't
 part of what you declared, so we only compare the keys you actually
-specified in `body`. That's intentional for scalar fields.
+specified in `body`. That's intentional for scalar fields, and it's also
+applied to single nested-object fields (e.g. Stream.stream_source): only
+the sub-keys the manifest declares are compared, not server-added extras
+fetch() returns alongside them.
 
 For list-of-dict fields (currently just `columns`), it's a different
 story: the manifest's list is treated as *authoritative/exhaustive* for
@@ -13,6 +16,15 @@ column that used to be declared and no longer is) is flagged as a
 DESTRUCTIVE removal, not silently absorbed into a generic "changed" diff.
 `apply_plan` refuses to execute destructive changes unless explicitly
 told to via `allow_destructive=True`.
+
+Two comparisons get extra normalization before the equality check, both
+found via live smoke testing against a real account (see CHANGELOG):
+  - A column's `datatype` is normalized (NUMBER == NUMBER(38,0), etc.)
+    since fetch() always returns the fully-qualified form even if the
+    manifest used shorthand.
+  - A `view`'s `query` has its `CREATE [OR REPLACE] VIEW ... AS ` DDL
+    wrapper stripped before comparing, since fetch() returns the full
+    CREATE statement, not just the SELECT the manifest declares.
 
 Objects with a raw `sql:` body (procedures, functions, anything better
 expressed as CREATE OR REPLACE than a typed model) skip the live-fetch
@@ -43,6 +55,213 @@ class Action(str, Enum):
     ERROR = "error"
 
 
+# --------------------------------------------------------------------- #
+# Datatype shorthand normalization (columns)
+# --------------------------------------------------------------------- #
+
+# Not exhaustive — covers the common numeric/string/binary/temporal
+# shorthands. Extend this if you hit a type Snowflake fully-qualifies
+# that isn't here yet; the symptom is a column that diffs as changed on
+# every single plan() even though nothing about it actually changed.
+_DATATYPE_DEFAULTS: dict[str, str] = {
+    "NUMBER": "NUMBER(38,0)",
+    "DECIMAL": "NUMBER(38,0)",
+    "NUMERIC": "NUMBER(38,0)",
+    "INT": "NUMBER(38,0)",
+    "INTEGER": "NUMBER(38,0)",
+    "BIGINT": "NUMBER(38,0)",
+    "SMALLINT": "NUMBER(38,0)",
+    "TINYINT": "NUMBER(38,0)",
+    "BYTEINT": "NUMBER(38,0)",
+    "VARCHAR": "VARCHAR(16777216)",
+    "STRING": "VARCHAR(16777216)",
+    "TEXT": "VARCHAR(16777216)",
+    "NVARCHAR": "VARCHAR(16777216)",
+    "NVARCHAR2": "VARCHAR(16777216)",
+    "CHAR": "VARCHAR(1)",
+    "CHARACTER": "VARCHAR(1)",
+    "NCHAR": "VARCHAR(1)",
+    "BINARY": "BINARY(8388608)",
+    "VARBINARY": "BINARY(8388608)",
+    "TIME": "TIME(9)",
+    "TIMESTAMP": "TIMESTAMP_NTZ(9)",
+    "DATETIME": "TIMESTAMP_NTZ(9)",
+    "TIMESTAMP_NTZ": "TIMESTAMP_NTZ(9)",
+    "TIMESTAMP_LTZ": "TIMESTAMP_LTZ(9)",
+    "TIMESTAMP_TZ": "TIMESTAMP_TZ(9)",
+}
+
+
+def _normalize_datatype(dt: Any) -> str:
+    """NUMBER -> NUMBER(38,0), VARCHAR -> VARCHAR(16777216), etc. Already-
+    parameterized types (anything with a '(' ) are assumed fully-qualified
+    already and compared as-is."""
+    s = str(dt).strip().upper()
+    if "(" in s:
+        return s
+    return _DATATYPE_DEFAULTS.get(s, s)
+
+
+def _column_field_differs(key: str, live_value: Any, desired_value: Any) -> bool:
+    """Per-declared-sub-field comparison for column-like list items,
+    shared between _diff_list_field (change detection) and
+    _render_list_diff (rendering) so the two can never disagree about
+    whether something actually changed."""
+    if key == "datatype":
+        return _normalize_datatype(live_value) != _normalize_datatype(desired_value)
+    return str(live_value).lower() != str(desired_value).lower()
+
+
+# --------------------------------------------------------------------- #
+# View query DDL-wrapper stripping
+# --------------------------------------------------------------------- #
+
+_VIEW_DDL_PREFIX_RE = re.compile(
+    r"^\s*CREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+\S+\s*(?:\([^)]*\)\s*)?AS\s+",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _strip_view_ddl_wrapper(raw: Any) -> str:
+    """fetch() returns a view's `query` as the full CREATE VIEW ... AS
+    <select> text, not just the SELECT — strip the wrapper so it can be
+    compared against (and diffed against) the manifest's bare query."""
+    s = str(raw)
+    match = _VIEW_DDL_PREFIX_RE.match(s)
+    return s[match.end():] if match else s
+
+
+# --------------------------------------------------------------------- #
+# List-of-dict (columns) unified-diff rendering
+# --------------------------------------------------------------------- #
+
+def _format_item(item: dict[str, Any]) -> str:
+    """'STATUS VARCHAR(20)' for a single extra field, '(k=v, k2=v2)' for
+    several — matches how a column with just a datatype reads naturally,
+    without over-formatting columns that carry more metadata."""
+    name = item.get("name", "?")
+    other = {k: v for k, v in item.items() if k != "name"}
+    if not other:
+        return str(name)
+    if len(other) == 1:
+        return f"{name} {next(iter(other.values()))}"
+    return f"{name} ({', '.join(f'{k}={v}' for k, v in other.items())})"
+
+
+def _render_list_diff(
+    live_value: Any,
+    desired_value: list[dict[str, Any]],
+    context: int,
+) -> str:
+    """Renders a list-of-dict field (columns, etc.) as a unified-diff-style
+    block: +/-/~ for actual changes, unchanged items shown only within
+    `context` lines of a change (git diff -U<context> semantics), longer
+    unchanged runs collapsed to a single '...' marker.
+
+    A changed item (same name, different declared sub-fields) renders as
+    a removed-old-line immediately followed by an added-new-line — the
+    full item on each side, not just the differing sub-field — matching
+    how a PR "suggested change" diff shows a modified line: the whole old
+    line struck through, the whole new line right below it.
+
+    Alignment uses difflib.SequenceMatcher on item *names*, not just a
+    flat compare — this positions removed/added/unchanged items correctly
+    relative to each other even when the list has more than a couple
+    items, rather than just dumping every changed item in isolation.
+    """
+    live_list: list[dict[str, Any]] = live_value if isinstance(live_value, list) else []
+    live_by_name = {str(i["name"]): i for i in live_list if isinstance(i, dict) and "name" in i}
+    desired_by_name = {str(i["name"]): i for i in desired_value if isinstance(i, dict) and "name" in i}
+    live_names = [str(i["name"]) for i in live_list if isinstance(i, dict) and "name" in i]
+    desired_names = [str(i["name"]) for i in desired_value if isinstance(i, dict) and "name" in i]
+
+    matcher = difflib.SequenceMatcher(None, live_names, desired_names, autojunk=False)
+
+    rows: list[tuple[str, str]] = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for name in live_names[i1:i2]:
+                live_item, desired_item = live_by_name[name], desired_by_name[name]
+                if any(
+                    k != "name" and _column_field_differs(k, live_item.get(k), v)
+                    for k, v in desired_item.items()
+                ):
+                    rows.append(("removed", f"- {_format_item(live_item)}"))
+                    rows.append(("added", f"+ {_format_item(desired_item)}"))
+                else:
+                    rows.append(("context", f"  {_format_item(live_item)}"))
+        else:
+            for name in live_names[i1:i2]:
+                rows.append(("removed", f"- {_format_item(live_by_name[name])}"))
+            for name in desired_names[j1:j2]:
+                rows.append(("added", f"+ {_format_item(desired_by_name[name])}"))
+
+    return "\n".join(_apply_context_window(rows, context, noun="column"))
+
+
+# --------------------------------------------------------------------- #
+# Multi-line text (e.g. view query) unified-diff rendering
+# --------------------------------------------------------------------- #
+
+def _render_text_diff(live_value: str, desired_value: str, context: int) -> str:
+    """Line-level diff for multi-line scalar text fields (a view's query,
+    etc.) — same context-window collapsing as _render_list_diff, standard
+    single-character +/-/space line prefixes (not difflib.unified_diff's
+    own output, which carries --- / +++ / file-path headers that aren't
+    meaningful here — there's no real file on either side)."""
+    live_lines = live_value.splitlines()
+    desired_lines = desired_value.splitlines()
+    matcher = difflib.SequenceMatcher(None, live_lines, desired_lines, autojunk=False)
+
+    rows: list[tuple[str, str]] = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for line in live_lines[i1:i2]:
+                rows.append(("context", f" {line}"))
+        else:
+            for line in live_lines[i1:i2]:
+                rows.append(("removed", f"-{line}"))
+            for line in desired_lines[j1:j2]:
+                rows.append(("added", f"+{line}"))
+
+    return "\n".join(_apply_context_window(rows, context, noun="line"))
+
+
+def _apply_context_window(rows: list[tuple[str, str]], context: int, noun: str = "column") -> list[str]:
+    """Keeps every non-'context' row, plus up to `context` 'context' rows
+    immediately above/below each one. Longer unchanged runs collapse to a
+    single '...' line instead of being dropped silently (so it's clear
+    something was omitted, not that the item list is actually shorter).
+
+    If there are no changes at all, there's nothing to window around —
+    collapsing would just hide the entire (unchanged) list behind a
+    single unhelpful marker, so everything is shown plainly instead."""
+    if all(status == "context" for status, _ in rows):
+        return [line for _, line in rows]
+
+    n = len(rows)
+    keep = [False] * n
+    for i, (status, _) in enumerate(rows):
+        if status != "context":
+            for j in range(max(0, i - context), min(n, i + context + 1)):
+                keep[j] = True
+
+    lines: list[str] = []
+    i = 0
+    while i < n:
+        if keep[i]:
+            lines.append(rows[i][1])
+            i += 1
+        else:
+            j = i
+            while j < n and not keep[j]:
+                j += 1
+            skipped = j - i
+            lines.append(f"  ... ({skipped} unchanged {noun}{'s' if skipped != 1 else ''}) ...")
+            i = j
+    return lines
+
+
 @dataclass
 class FieldDiff:
     live: Any
@@ -50,73 +269,36 @@ class FieldDiff:
     # Names of list-items present live but absent from the manifest for
     # this field (e.g. dropped columns). Empty for non-destructive changes.
     removed_items: list[str] = field(default_factory=list)
-    # Names of list-items present in the manifest but not live yet (e.g. a
-    # new column being added alongside existing ones on an UPDATE).
-    added_items: list[str] = field(default_factory=list)
-    # item name -> {subfield_name: (live_value, desired_value)}, for items
-    # present on both sides but with one or more sub-fields differing
-    # (e.g. a column whose datatype changed).
-    changed_items: dict[str, dict[str, tuple[Any, Any]]] = field(default_factory=dict)
 
     @property
     def is_destructive(self) -> bool:
         return bool(self.removed_items)
 
-    def render(self) -> str:
-        """Human-readable summary of this field's change. Three shapes,
-        chosen by what the field actually is:
-          - list-of-dict fields (columns): git-style '+ NAME TYPE' /
-            '- NAME TYPE' / '~ NAME (sub: old -> new)', one entry per item.
-          - multi-line string fields (a view's query, or anything else
-            long enough to need it): a unified diff with a couple lines
-            of context around each change, same idea as `git diff` or a
-            Notepad++ compare — not the whole text dumped twice.
-          - everything else (short scalars): a plain 'old -> new' line.
+    def render(self, context: int = 2) -> str:
+        """Human-readable rendering of this field's change.
+
+        For list-of-dict fields (columns, etc.): a unified-diff-style
+        block, +/-/~ per item, with unchanged items shown only within
+        `context` lines of an actual change and longer unchanged runs
+        collapsed to a single '...' marker.
+
+        For multi-line scalar text fields (either side containing a
+        newline — e.g. a view's query): the same context-window idea,
+        applied line-by-line, standard unified-diff single-char prefixes.
+
+        For single-line scalar fields: a plain 'live -> desired' line —
+        a unified diff would just be noise for a one-line value with
+        nothing to give context on.
         """
-        if not (self.added_items or self.removed_items or self.changed_items):
-            if isinstance(self.live, str) and isinstance(self.desired, str) and self.live != self.desired:
-                text_diff = _unified_text_diff(self.live, self.desired)
-                if text_diff is not None:
-                    return text_diff
-            return f"{self.live!r} -> {self.desired!r}"
-
-        def _find(items: Any, name: str) -> dict[str, Any]:
-            if isinstance(items, list):
-                for item in items:
-                    if isinstance(item, dict) and item.get("name") == name:
-                        return item
-            return {}
-
-        lines: list[str] = []
-        for name in self.added_items:
-            item = _find(self.desired, name)
-            detail = item.get("datatype", "")
-            lines.append(f"+ {name}{f' {detail}' if detail else ''}")
-        for name in self.removed_items:
-            item = _find(self.live, name)
-            detail = item.get("datatype", "")
-            lines.append(f"- {name}{f' {detail}' if detail else ''}")
-        for name, subfields in self.changed_items.items():
-            detail = ", ".join(f"{k}: {old} -> {new}" for k, (old, new) in subfields.items())
-            lines.append(f"~ {name} ({detail})")
-        return "; ".join(lines)
-
-
-def _unified_text_diff(live: str, desired: str, context: int = 2) -> str | None:
-    """A Notepad++/git-style line-level diff with `context` lines of
-    unchanged surrounding text on either side of each change, rather than
-    dumping the entire old and new text. Returns None if the text isn't
-    multi-line — a single-line scalar reads better as a plain
-    'old -> new' line, which is what the caller falls back to."""
-    if "\n" not in live and "\n" not in desired:
-        return None
-    live_lines = live.splitlines()
-    desired_lines = desired.splitlines()
-    hunks = list(difflib.unified_diff(live_lines, desired_lines, lineterm="", n=context))
-    # Drop the '--- '/'+++ ' filename header lines difflib always emits
-    # first — meaningless here since there's no real file on either side.
-    body = [ln for ln in hunks if not (ln.startswith("--- ") or ln.startswith("+++ "))]
-    return "\n".join(body) if body else None
+        if isinstance(self.desired, list) and all(isinstance(x, dict) for x in self.desired):
+            return _render_list_diff(self.live, self.desired, context)
+        if (
+            isinstance(self.desired, str)
+            and isinstance(self.live, str)
+            and ("\n" in self.desired or "\n" in self.live)
+        ):
+            return _render_text_diff(self.live, self.desired, context)
+        return f"{self.live!r} -> {self.desired!r}"
 
 
 @dataclass
@@ -155,99 +337,38 @@ def _diff_list_field(live_value: Any, desired_value: list[dict[str, Any]]) -> Fi
     }
 
     removed: list[str] = [name for name in live_by_name if name not in desired_by_name]
-    added: list[str] = [name for name in desired_by_name if name not in live_by_name]
 
-    changed_items: dict[str, dict[str, tuple[Any, Any]]] = {}
+    changed = False
     for name, desired_item in desired_by_name.items():
         live_item = live_by_name.get(name)
         if live_item is None:
-            continue  # captured in `added` above
-        item_changes: dict[str, tuple[Any, Any]] = {}
+            changed = True  # new item — additive, not destructive
+            continue
         for k, v in desired_item.items():
-            live_v = live_item.get(k)
-            if k == "datatype":
-                if _normalize_type(live_v) != _normalize_type(v):
-                    item_changes[k] = (live_v, v)
-            elif not _values_match(live_v, v):
-                item_changes[k] = (live_v, v)
-        if item_changes:
-            changed_items[name] = item_changes
+            if _column_field_differs(k, live_item.get(k), v):
+                changed = True
 
-    if not removed and not added and not changed_items:
+    if not removed and not changed:
         return None
-    return FieldDiff(
-        live=live_value, desired=desired_value,
-        removed_items=removed, added_items=added, changed_items=changed_items,
-    )
+    return FieldDiff(live=live_value, desired=desired_value, removed_items=removed)
 
 
-# Base Snowflake type names mapped to the canonical form `fetch()` returns
-# them as, so a manifest can write the short form without permanently
-# diffing against Snowflake's fully-qualified precision/scale/length.
-# Best-effort, not exhaustive — extend as new mismatches surface.
-_TYPE_CANONICAL = {
-    "NUMBER": "NUMBER(38,0)",
-    "DECIMAL": "NUMBER(38,0)",
-    "NUMERIC": "NUMBER(38,0)",
-    "INT": "NUMBER(38,0)",
-    "INTEGER": "NUMBER(38,0)",
-    "BIGINT": "NUMBER(38,0)",
-    "SMALLINT": "NUMBER(38,0)",
-    "TINYINT": "NUMBER(38,0)",
-    "BYTEINT": "NUMBER(38,0)",
-    "VARCHAR": "VARCHAR(16777216)",
-    "STRING": "VARCHAR(16777216)",
-    "TEXT": "VARCHAR(16777216)",
-    "CHAR": "VARCHAR(1)",
-    "CHARACTER": "VARCHAR(1)",
-}
-
-
-def _normalize_type(t: Any) -> str:
-    """Canonicalizes a Snowflake column datatype string for comparison —
-    e.g. 'NUMBER' and 'NUMBER(38,0)' are the same type to Snowflake, but
-    fetch() always returns the fully-qualified form, so a manifest using
-    the short form would otherwise diff as changed on every plan/apply."""
-    s = str(t).strip().upper()
-    return _TYPE_CANONICAL.get(s, s)
+def _dict_values_match(live_value: Any, desired_value: dict[str, Any]) -> bool:
+    """Subset comparison for a single nested-object field (e.g.
+    Stream.stream_source): only the keys the manifest actually declared
+    are compared, ignoring server-computed extras fetch() returns
+    alongside them (database_name, schema_name, append_only, ...)."""
+    if not isinstance(live_value, dict):
+        return False
+    return all(str(live_value.get(k)).lower() == str(v).lower() for k, v in desired_value.items())
 
 
 def _values_match(live_value: Any, desired_value: Any) -> bool:
-    """Loose equality for scalar/non-list fields. A dict compares as a
-    declared subset — recursively — so a nested object field (e.g.
-    Stream.stream_source) only diffs on the keys the manifest actually
-    declared, not server-computed extras fetch() returns alongside them."""
-    if isinstance(desired_value, dict):
-        if not isinstance(live_value, dict):
-            return False
-        return all(_values_match(live_value.get(k), v) for k, v in desired_value.items())
+    """Loose equality for scalar/non-list/non-dict fields."""
     return str(live_value).lower() == str(desired_value).lower()
 
 
-def _normalize_whitespace(s: str) -> str:
-    return " ".join(s.split())
-
-
-# Matches up through the first top-level "AS" that follows "VIEW" in the
-# DDL text fetch() returns for a view — i.e. the boundary between the
-# "CREATE [OR REPLACE] VIEW <name> [(col, ...)]" header and the actual
-# query. Non-greedy so it stops at that first AS rather than one inside
-# the query body itself.
-_VIEW_DDL_HEADER_RE = re.compile(r"\bVIEW\b.*?\bAS\b\s*", re.IGNORECASE | re.DOTALL)
-
-
-def _extract_view_query(live_ddl: str) -> str:
-    """fetch() returns a view's `query` field as the full CREATE VIEW DDL
-    text, not just the SELECT — extract everything after the header so it
-    can be compared against the manifest's bare query. Falls back to the
-    raw string if the expected header shape isn't found."""
-    match = _VIEW_DDL_HEADER_RE.search(live_ddl)
-    if not match:
-        return live_ddl.strip()
-    return live_ddl[match.end():].strip()
-
-
-def _diff_fields(live: dict[str, Any], desired: dict[str, Any], resource: str | None = None) -> dict[str, FieldDiff]:
+def _diff_fields(live: dict[str, Any], desired: dict[str, Any], resource: str) -> dict[str, FieldDiff]:
     changes: dict[str, FieldDiff] = {}
     for field_name, desired_value in desired.items():
         live_value = live.get(field_name)
@@ -258,13 +379,13 @@ def _diff_fields(live: dict[str, Any], desired: dict[str, Any], resource: str | 
                 changes[field_name] = list_diff
             continue
 
-        if resource == "view" and field_name == "query" and isinstance(live_value, str) and isinstance(desired_value, str):
-            live_extracted = _extract_view_query(live_value)
-            live_cmp = _normalize_whitespace(live_extracted)
-            desired_cmp = _normalize_whitespace(desired_value)
-            if live_cmp.lower() != desired_cmp.lower():
-                changes[field_name] = FieldDiff(live=live_extracted, desired=desired_value)
+        if isinstance(desired_value, dict):
+            if not _dict_values_match(live_value, desired_value):
+                changes[field_name] = FieldDiff(live=live_value, desired=desired_value)
             continue
+
+        if resource == "view" and field_name == "query" and isinstance(desired_value, str):
+            live_value = _strip_view_ddl_wrapper(live_value)
 
         if not _values_match(live_value, desired_value):
             changes[field_name] = FieldDiff(live=live_value, desired=desired_value)

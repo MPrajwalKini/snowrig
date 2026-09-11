@@ -131,6 +131,32 @@ def describe_error(exc: Exception) -> str:
     return str(exc)
 
 
+def _reorder_new_columns_to_end(
+    live_column_names: list[str], desired_columns: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """`CREATE OR ALTER TABLE` can only add genuinely new columns at the end
+    of the column list — supplying one anywhere else fails server-side with
+    "unsupported feature 'create or alter table column add before end of
+    column list'" (see Snowflake's CREATE OR ALTER TABLE usage notes). The
+    manifest is free to declare columns in whatever order reads best, so
+    reorder just before sending: every column that already exists live keeps
+    its live relative position (untouched, whether altered or not), and any
+    column absent from the live table — a real addition — is moved to the
+    end, in the order the manifest declared them. This only reshuffles what
+    gets sent over the wire; the manifest's own declared order is left alone
+    everywhere else (plan/diff rendering, etc.)."""
+    live_order = {name: i for i, name in enumerate(live_column_names)}
+    desired_by_name = {
+        str(col["name"]): col for col in desired_columns if isinstance(col, dict) and "name" in col
+    }
+    existing = [
+        desired_by_name[name]
+        for name in sorted((n for n in desired_by_name if n in live_order), key=live_order.__getitem__)
+    ]
+    new = [col for col in desired_columns if str(col.get("name")) not in live_order]
+    return existing + new
+
+
 class CoreObjectClient:
     def __init__(self, root: Any):
         self._root = root
@@ -147,6 +173,18 @@ class CoreObjectClient:
         except NotFoundError:
             return False
 
+    def _reorder_table_columns_for_wire(self, item: Any, body: dict[str, Any]) -> dict[str, Any]:
+        """Only meaningful for an existing table with a declared `columns`
+        list — a brand-new table has no live columns to preserve the order
+        of, so every declared column is "new" and list order is harmless."""
+        try:
+            live_columns = item.fetch().columns or []
+        except NotFoundError:
+            return body
+        live_names = [getattr(col, "name", None) for col in live_columns]
+        live_names = [name for name in live_names if name is not None]
+        return {**body, "columns": _reorder_new_columns_to_end(live_names, body["columns"])}
+
     def create_or_alter(
         self, resource: str, path_params: dict[str, str], body: dict[str, Any]
     ) -> None:
@@ -155,8 +193,10 @@ class CoreObjectClient:
         if coercer is not None:
             body = coercer(body)
         collection = get_collection(self._root, resource, path_params)
-        model = model_cls(name=path_params["name"], **body)
         item = collection[path_params["name"]]
+        if resource == "table" and isinstance(body.get("columns"), list):
+            body = self._reorder_table_columns_for_wire(item, body)
+        model = model_cls(name=path_params["name"], **body)
         if hasattr(item, "create_or_alter"):
             item.create_or_alter(model)
         else:

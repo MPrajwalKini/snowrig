@@ -409,7 +409,8 @@ def test_render_shows_changed_column_datatype():
     [change] = compute_plan([obj], client)
     rendered = change.diff["columns"].render()
 
-    assert rendered == "~ AMOUNT (datatype: NUMBER(38,0) -> VARCHAR(50))"
+    assert "- AMOUNT NUMBER(38,0)" in rendered.splitlines()
+    assert "+ AMOUNT VARCHAR(50)" in rendered.splitlines()
 
 
 def test_render_falls_back_to_plain_line_for_scalar_fields():

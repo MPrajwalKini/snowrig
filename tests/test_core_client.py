@@ -24,6 +24,7 @@ from snowrig.resources.core_client import (
     CoreObjectClient,
     _coerce_stream_body,
     _coerce_task_body,
+    _reorder_new_columns_to_end,
     describe_error,
 )
 
@@ -215,6 +216,7 @@ class _FakeSchemaScope:
     def __init__(self, collection: _FakeCollection):
         self.streams = collection
         self.tasks = collection
+        self.tables = collection
 
 
 class _FakeSchemasIndex:
@@ -309,6 +311,114 @@ def test_exists_returns_true_when_fetch_succeeds():
     client = CoreObjectClient(root)
 
     assert client.exists("task", {"database": "DB", "schema": "PUBLIC", "name": "EXISTS"}) is True
+
+
+# --------------------------------------------------------------------- #
+# _reorder_new_columns_to_end
+# --------------------------------------------------------------------- #
+
+def test_reorder_leaves_columns_alone_when_nothing_is_new():
+    live_names = ["A", "B", "C"]
+    desired = [{"name": "A"}, {"name": "B", "datatype": "VARCHAR(99)"}, {"name": "C"}]
+
+    assert _reorder_new_columns_to_end(live_names, desired) == desired
+
+
+def test_reorder_moves_a_mid_list_new_column_to_the_end():
+    """Mirrors the real-world failure: a manifest that declares a new column
+    in the same list position as a column it's replacing must still send
+    that new column *last* to CREATE OR ALTER TABLE, since Snowflake only
+    accepts new columns at the end of the column list."""
+    live_names = ["A", "B", "C", "D"]
+    desired = [{"name": "A"}, {"name": "B"}, {"name": "NEW"}, {"name": "D"}]  # C dropped, NEW added mid-list
+
+    result = _reorder_new_columns_to_end(live_names, desired)
+
+    assert [c["name"] for c in result] == ["A", "B", "D", "NEW"]
+
+
+def test_reorder_preserves_live_relative_order_even_if_manifest_order_differs():
+    """Existing columns keep the *live* table's order, not the manifest's —
+    only the position of genuinely new columns is touched."""
+    live_names = ["A", "B", "C"]
+    desired = [{"name": "C"}, {"name": "A"}, {"name": "B"}, {"name": "NEW"}]
+
+    result = _reorder_new_columns_to_end(live_names, desired)
+
+    assert [c["name"] for c in result] == ["A", "B", "C", "NEW"]
+
+
+def test_reorder_appends_multiple_new_columns_in_manifest_order():
+    live_names = ["A"]
+    desired = [{"name": "NEW1"}, {"name": "A"}, {"name": "NEW2"}]
+
+    result = _reorder_new_columns_to_end(live_names, desired)
+
+    assert [c["name"] for c in result] == ["A", "NEW1", "NEW2"]
+
+
+def test_reorder_with_no_live_columns_leaves_manifest_order_as_is():
+    """A brand-new table: every declared column is 'new', so there's nothing
+    to reorder relative to."""
+    desired = [{"name": "B"}, {"name": "A"}]
+
+    assert _reorder_new_columns_to_end([], desired) == desired
+
+
+# --------------------------------------------------------------------- #
+# CoreObjectClient.create_or_alter — table column reordering
+# --------------------------------------------------------------------- #
+
+class _FakeExistingTable:
+    """Stands in for the model returned by item.fetch() — only `.columns`,
+    a list of objects exposing `.name`, is read by the reordering logic."""
+
+    def __init__(self, column_names: list[str]):
+        self.columns = [_SimpleNamespace(name=n) for n in column_names]
+
+
+class _SimpleNamespace:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+def test_create_or_alter_reorders_new_table_columns_to_the_end():
+    from snowflake.core.table import Table
+
+    existing = _FakeExistingTable(["A", "B", "C"])
+    item = _FakeItem(existing_model=existing)
+    collection = _FakeCollection(item)
+    root = _FakeRoot(collection)
+    client = CoreObjectClient(root)
+
+    client.create_or_alter(
+        "table",
+        {"database": "DB", "schema": "PUBLIC", "name": "T"},
+        {"columns": [{"name": "A"}, {"name": "NEW"}, {"name": "C"}]},  # B dropped, NEW mid-list
+    )
+
+    [model] = item.create_or_alter_calls
+    assert isinstance(model, Table)
+    assert [c.name for c in model.columns] == ["A", "C", "NEW"]
+
+
+def test_create_or_alter_skips_reorder_for_a_brand_new_table():
+    from snowflake.core.table import Table
+
+    item = _FakeItem(existing_model=None)  # fetch() raises NotFoundError
+    collection = _FakeCollection(item)
+    root = _FakeRoot(collection)
+    client = CoreObjectClient(root)
+
+    client.create_or_alter(
+        "table",
+        {"database": "DB", "schema": "PUBLIC", "name": "T"},
+        {"columns": [{"name": "B"}, {"name": "A"}]},
+    )
+
+    [model] = item.create_or_alter_calls
+    assert isinstance(model, Table)
+    assert [c.name for c in model.columns] == ["B", "A"]
 
 
 def test_delete_drops_the_item():

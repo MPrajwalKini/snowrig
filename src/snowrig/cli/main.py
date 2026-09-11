@@ -11,7 +11,7 @@ from rich.table import Table
 from snowflake.core import Root
 
 import snowrig
-from snowrig import Action
+from snowrig import Action, PlannedChange
 from snowrig.config import DEFAULT_CONFIG_PATH, load_profile
 from snowrig.connection import connect
 from snowrig.resources.core_client import CoreObjectClient
@@ -117,23 +117,40 @@ def fetch(
 
 def _action_style(action: Action) -> str:
     return {
-        Action.CREATE: "[green]+ create[/green]",
-        Action.UPDATE: "[yellow]~ update[/yellow]",
-        Action.NOOP: "[dim]  no-op[/dim]",
-        Action.ERROR: "[red]! error[/red]",
+        Action.CREATE: "[green]create[/green]",
+        Action.UPDATE: "[yellow]update[/yellow]",
+        Action.NOOP: "[dim]no-op[/dim]",
+        Action.ERROR: "[red]error[/red]",
     }[action]
 
 
-def _color_diff_line(line: str) -> str:
-    """Applies Terraform-style coloring to one rendered diff line: green for
-    an addition, red for a removal, yellow for an in-place change."""
-    if line.startswith("+ "):
-        return f"[green]{line}[/green]"
-    if line.startswith("- "):
-        return f"[red]{line}[/red]"
-    if line.startswith("~ "):
-        return f"[yellow]{line}[/yellow]"
-    return line
+def _render_changed_fields(change: PlannedChange) -> str:
+    """Builds the 'Changed fields' cell: a DESTRUCTIVE banner if
+    applicable, then each changed field's name followed by its rendered
+    diff (colorized per line — +green/-red/~yellow, context lines dim)."""
+    if change.error:
+        return f"[red]{change.error}[/red]"
+    if not change.diff:
+        return ""
+
+    parts = []
+    if change.is_destructive:
+        parts.append(f"[red]⚠ DESTRUCTIVE[/red] — {change.destructive_summary()}")
+    for field_name, field_diff in change.diff.items():
+        rendered = field_diff.render()
+        colored_lines = []
+        for line in rendered.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("+"):
+                colored_lines.append(f"[green]{line}[/green]")
+            elif stripped.startswith("-"):
+                colored_lines.append(f"[red]{line}[/red]")
+            elif stripped.startswith("~"):
+                colored_lines.append(f"[yellow]{line}[/yellow]")
+            else:
+                colored_lines.append(f"[dim]{line}[/dim]")
+        parts.append(f"{field_name}:\n" + "\n".join(colored_lines))
+    return "\n".join(parts)
 
 
 @app.command()
@@ -147,39 +164,22 @@ def plan(
         console.print(f"[yellow]No .yaml objects found under {manifest_dir}[/yellow]")
         return
 
-    table = Table("Action", "Resource", "Object", "Changed fields")
+    table = Table("Action", "Resource", "Object", "Changed fields", show_lines=True)
     for change in plan_result:
-        if change.diff:
-            lines = []
-            for fname, d in change.diff.items():
-                if fname == "sql":
-                    lines.append("sql: will be (re-)applied")
-                    continue
-                rendered = d.render()
-                if any(rendered.startswith(p) for p in ("+ ", "- ", "~ ")):
-                    lines.append(f"{fname}:")
-                    lines.extend(f"  {_color_diff_line(part)}" for part in rendered.split("; "))
-                else:
-                    lines.append(f"{fname}: {rendered}")
-            fields = "\n".join(lines)
-        else:
-            fields = change.error or ""
-        if change.is_destructive:
-            fields = f"[red]⚠ DESTRUCTIVE[/red]\n{fields}" if fields else "[red]⚠ DESTRUCTIVE[/red]"
         table.add_row(
-            _action_style(change.action), change.key.resource, change.key.qualified_name, fields
+            _action_style(change.action),
+            change.key.resource,
+            change.key.qualified_name,
+            _render_changed_fields(change),
         )
     console.print(table)
 
-    n_create = sum(1 for c in plan_result if c.action == Action.CREATE)
-    n_update = sum(1 for c in plan_result if c.action == Action.UPDATE)
-    n_destructive = sum(1 for c in plan_result if c.is_destructive)
-    n_error = sum(1 for c in plan_result if c.action == Action.ERROR)
-    summary = f"Plan: [green]{n_create} to add[/green], [yellow]{n_update} to change[/yellow]"
-    if n_destructive:
-        summary += f", [red]{n_destructive} destructive (blocked without --allow-destructive)[/red]"
-    if n_error:
-        summary += f", [red]{n_error} error(s)[/red]"
+    to_add = sum(1 for c in plan_result if c.action == Action.CREATE)
+    to_change = sum(1 for c in plan_result if c.action == Action.UPDATE)
+    destructive = sum(1 for c in plan_result if c.is_destructive)
+    summary = f"Plan: {to_add} to add, {to_change} to change"
+    if destructive:
+        summary += f", [red]{destructive} destructive (blocked without --allow-destructive)[/red]"
     console.print(summary + ".")
 
 

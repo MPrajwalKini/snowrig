@@ -23,6 +23,22 @@ Local changes since the `0.3.2` upload — not yet published.
 - `tests/test_session.py` (11 tests) and `tests/test_core_registry.py`
   (26 tests) — first direct coverage of either.
 
+### Fixed
+- `apply()` of a table update that adds a new column anywhere but the end
+  of the manifest's `columns:` list (e.g. a new column declared in the
+  same position as one being dropped) failed with Snowflake's
+  `unsupported feature 'create or alter table column add before end of
+  column list'` — `CREATE OR ALTER TABLE` only accepts new columns at
+  the very end of the column list, but `body["columns"]` was sent
+  straight from the manifest in whatever order it was declared. Caught
+  by the smoke test's Round 4 (destructive-change gate). Fixed in
+  `resources/core_client.py`: `create_or_alter` now fetches the table's
+  live column order first and reorders just the outgoing `columns` list
+  so genuinely new columns land last, while every existing column keeps
+  its live relative position — this only affects what's sent over the
+  wire, not the manifest's own declared order or how `plan()` renders
+  the diff. New tests in `test_core_client.py`.
+
 ### Notes
 - Deliberately still excludes grants/roles/users from resource coverage
   — see `core_registry.py`'s module docstring for why.
