@@ -26,6 +26,7 @@ body. That's why QueryRequest/TestRequest/Request are all defined here
 at module scope, with real (non-deferred) annotations.
 """
 
+import hmac
 import os
 from pathlib import Path
 from typing import Any, Optional
@@ -66,7 +67,10 @@ def build_app(config_path: Optional[Path] = None, token_env: str = "SNOWRIG_API_
                 detail=f"server misconfigured: {token_env} is not set in its environment",
             )
         got = request.headers.get("authorization", "")
-        if got != f"Bearer {expected}":
+        # Constant-time compare — a plain `!=` short-circuits on the first
+        # mismatched byte, which leaks how many leading characters of the
+        # token a guess got right via response-time differences.
+        if not hmac.compare_digest(got, f"Bearer {expected}"):
             raise HTTPException(status_code=401, detail="missing or invalid bearer token")
 
     def _get_connection(profile_name: str):
@@ -120,6 +124,15 @@ def build_app(config_path: Optional[Path] = None, token_env: str = "SNOWRIG_API_
             columns, rows, rowcount = SqlRunner(conn).run_query(body.sql, body.params)
             return {"columns": columns, "rows": rows, "rowcount": rowcount}
         except Exception as e:
+            # Mirrors test-connection's cache eviction: if the failure left
+            # the connection itself closed (a dropped network connection, an
+            # expired session, ...), drop it from the cache so the *next*
+            # request reconnects instead of repeatedly retrying a connection
+            # that's already dead. A plain SQL error (bad syntax, missing
+            # table) leaves the connection open, so it's kept and reused —
+            # only actual connection failures trigger eviction.
+            if conn.is_closed():
+                connections.pop(body.profile, None)
             raise HTTPException(status_code=400, detail=str(e)) from e
 
     return app

@@ -239,6 +239,63 @@ def test_query_sql_error_returns_400_not_500(client, monkeypatch):
     assert cursor.closed is True  # finally: block still closes the cursor on error
 
 
+def test_query_evicts_cached_connection_when_failure_leaves_it_closed(client, monkeypatch):
+    """A query that fails because the connection itself died mid-request
+    (not a SQL error) must be evicted from the cache — otherwise every
+    subsequent request for that profile keeps retrying the same dead
+    connection forever."""
+    connect_calls = []
+
+    class _DyingCursor(_FakeCursor):
+        """Simulates a dropped network connection: the query fails AND
+        the connection is left closed by the time the exception is
+        caught, the way the real Snowflake connector would leave it."""
+
+        def __init__(self, conn):
+            super().__init__(raise_on_execute=RuntimeError("250002: Connection is closed"))
+            self._conn = conn
+
+        def execute(self, sql, *args):
+            self._conn._closed = True
+            return super().execute(sql, *args)
+
+    def _fake_connect(profile):
+        conn = _FakeConnection(None)
+        conn._cursor = _DyingCursor(conn)
+        connect_calls.append(conn)
+        return conn
+
+    monkeypatch.setattr(server_module, "connect", _fake_connect)
+
+    response = client.post(
+        "/v1/query", json={"profile": "default", "sql": "SELECT 1"}, headers=_auth_headers()
+    )
+    assert response.status_code == 400
+
+    # Next request must reconnect rather than reuse the now-dead connection.
+    client.post("/v1/query", json={"profile": "default", "sql": "SELECT 2"}, headers=_auth_headers())
+    assert len(connect_calls) == 2
+
+
+def test_query_keeps_cached_connection_after_a_plain_sql_error(client, monkeypatch):
+    """The opposite case: a SQL error (bad syntax, missing table) leaves
+    the connection itself open, so it must be kept and reused rather than
+    reconnected on every bad query."""
+    connect_calls = []
+
+    def _fake_connect(profile):
+        conn = _FakeConnection(_FakeCursor(raise_on_execute=RuntimeError("SQL compilation error")))
+        connect_calls.append(conn)
+        return conn
+
+    monkeypatch.setattr(server_module, "connect", _fake_connect)
+
+    client.post("/v1/query", json={"profile": "default", "sql": "SELECT nope"}, headers=_auth_headers())
+    client.post("/v1/query", json={"profile": "default", "sql": "SELECT also_nope"}, headers=_auth_headers())
+
+    assert len(connect_calls) == 1  # second request reused the same (still-open) connection
+
+
 def test_query_reuses_cached_connection_across_requests(client, monkeypatch):
     connect_calls = []
 

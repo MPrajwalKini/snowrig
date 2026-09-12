@@ -178,6 +178,46 @@ def test_destructive_change_proceeds_with_allow_destructive():
     assert body["columns"] == [{"name": "ID", "datatype": "NUMBER(38,0)"}]
 
 
+def test_blocked_destructive_change_does_not_halt_other_changes_even_with_default_stop_on_error():
+    """A blocked destructive change is an intentional, expected outcome of
+    the safety gate — not a failure. It must not also silently prevent
+    every other, unrelated, safe change in the same apply() batch from
+    being attempted, even under the default stop_on_error=True. Otherwise
+    one column drop anywhere in a large manifest would silently no-op an
+    entire deploy with no indication anything was skipped."""
+    destructive_obj = _table("CUSTOMERS", [{"name": "ID", "datatype": "NUMBER(38,0)"}])
+    safe_obj = _table("ORDERS", [{"name": "ID", "datatype": "NUMBER(38,0)"}, {"name": "TOTAL", "datatype": "NUMBER(10,2)"}])
+    client = FakeCoreObjectClient(
+        live={
+            ("table", "CUSTOMERS"): {
+                "columns": [
+                    {"name": "ID", "datatype": "NUMBER(38,0)"},
+                    {"name": "EMAIL", "datatype": "VARCHAR(255)"},  # dropped by destructive_obj
+                ]
+            },
+            ("table", "ORDERS"): {"columns": [{"name": "ID", "datatype": "NUMBER(38,0)"}]},  # TOTAL is additive
+        }
+    )
+    plan = compute_plan([destructive_obj, safe_obj], client)
+
+    results = apply_plan(plan, client, stop_on_error=True)  # the default — deliberately explicit here
+
+    by_name = {change.key.qualified_name: (change, error) for change, error in results}
+    assert len(results) == 2, "both objects must be reported, not just the blocked one"
+
+    customers_change, customers_error = by_name["DB.PUBLIC.CUSTOMERS"]
+    assert customers_change.blocked is not None
+    assert customers_error == customers_change.blocked
+
+    orders_change, orders_error = by_name["DB.PUBLIC.ORDERS"]
+    assert orders_change.blocked is None
+    assert orders_error is None
+    assert len(client.applied) == 1
+    resource, _, body = client.applied[0]
+    assert resource == "table"
+    assert body["columns"] == [{"name": "ID", "datatype": "NUMBER(38,0)"}, {"name": "TOTAL", "datatype": "NUMBER(10,2)"}]
+
+
 def test_noop_changes_are_not_applied():
     columns = [{"name": "ID", "datatype": "NUMBER(38,0)"}]
     obj = _table("CUSTOMERS", columns)
@@ -318,6 +358,108 @@ def test_column_datatype_still_detects_real_type_change():
 
     assert change.action == Action.UPDATE
     assert "columns" in change.diff
+
+
+# --------------------------------------------------------------------- #
+# Lossy datatype narrowing — flagged destructive even without a column drop
+# --------------------------------------------------------------------- #
+
+def test_shortening_varchar_length_is_destructive():
+    """CREATE OR ALTER TABLE will attempt VARCHAR(150) -> VARCHAR(50)
+    without complaint — Snowflake truncates the actual row data rather
+    than refusing the DDL. That's data loss, so it must be flagged
+    destructive even though no column is being dropped."""
+    obj = _table("CUSTOMERS", [{"name": "LABEL", "datatype": "VARCHAR(50)"}])
+    client = FakeCoreObjectClient(live={
+        ("table", "CUSTOMERS"): {"columns": [{"name": "LABEL", "datatype": "VARCHAR(150)"}]},
+    })
+
+    [change] = compute_plan([obj], client)
+
+    assert change.is_destructive
+    assert change.diff["columns"].narrowed_items == ["LABEL (VARCHAR(150) -> VARCHAR(50))"]
+    assert "LABEL" in change.destructive_summary()
+    assert "narrowed" in change.destructive_summary()
+
+
+def test_widening_varchar_length_is_not_destructive():
+    """The opposite direction — VARCHAR(100) -> VARCHAR(150) — is always
+    safe and must not trip the same gate."""
+    obj = _table("CUSTOMERS", [{"name": "LABEL", "datatype": "VARCHAR(150)"}])
+    client = FakeCoreObjectClient(live={
+        ("table", "CUSTOMERS"): {"columns": [{"name": "LABEL", "datatype": "VARCHAR(100)"}]},
+    })
+
+    [change] = compute_plan([obj], client)
+
+    assert not change.is_destructive
+    assert change.diff["columns"].narrowed_items == []
+
+
+def test_reducing_number_precision_is_destructive():
+    obj = _table("CUSTOMERS", [{"name": "AMOUNT", "datatype": "NUMBER(10,0)"}])
+    client = FakeCoreObjectClient(live={
+        ("table", "CUSTOMERS"): {"columns": [{"name": "AMOUNT", "datatype": "NUMBER(38,0)"}]},
+    })
+
+    [change] = compute_plan([obj], client)
+
+    assert change.is_destructive
+    assert change.diff["columns"].narrowed_items == ["AMOUNT (NUMBER(38,0) -> NUMBER(10,0))"]
+
+
+def test_reducing_number_scale_is_destructive():
+    obj = _table("CUSTOMERS", [{"name": "AMOUNT", "datatype": "NUMBER(10,2)"}])
+    client = FakeCoreObjectClient(live={
+        ("table", "CUSTOMERS"): {"columns": [{"name": "AMOUNT", "datatype": "NUMBER(10,5)"}]},
+    })
+
+    [change] = compute_plan([obj], client)
+
+    assert change.is_destructive
+    assert change.diff["columns"].narrowed_items == ["AMOUNT (NUMBER(10,5) -> NUMBER(10,2))"]
+
+
+def test_increasing_number_precision_is_not_destructive():
+    obj = _table("CUSTOMERS", [{"name": "AMOUNT", "datatype": "NUMBER(20,2)"}])
+    client = FakeCoreObjectClient(live={
+        ("table", "CUSTOMERS"): {"columns": [{"name": "AMOUNT", "datatype": "NUMBER(10,2)"}]},
+    })
+
+    [change] = compute_plan([obj], client)
+
+    assert not change.is_destructive
+
+
+def test_changing_datatype_family_entirely_is_destructive():
+    """VARCHAR -> NUMBER (or vice versa) can't preserve data faithfully in
+    general — treated the same as a narrowing change."""
+    obj = _table("CUSTOMERS", [{"name": "CODE", "datatype": "NUMBER(38,0)"}])
+    client = FakeCoreObjectClient(live={
+        ("table", "CUSTOMERS"): {"columns": [{"name": "CODE", "datatype": "VARCHAR(50)"}]},
+    })
+
+    [change] = compute_plan([obj], client)
+
+    assert change.is_destructive
+    assert change.diff["columns"].narrowed_items == ["CODE (VARCHAR(50) -> NUMBER(38,0))"]
+
+
+def test_narrowing_change_is_blocked_without_allow_destructive():
+    """Same protection path as column drops — apply_plan must refuse a
+    narrowing datatype change by default, not just a drop."""
+    obj = _table("CUSTOMERS", [{"name": "LABEL", "datatype": "VARCHAR(50)"}])
+    client = FakeCoreObjectClient(live={
+        ("table", "CUSTOMERS"): {"columns": [{"name": "LABEL", "datatype": "VARCHAR(150)"}]},
+    })
+    plan_result = compute_plan([obj], client)
+
+    results = apply_plan(plan_result, client, allow_destructive=False)
+
+    [(change, error)] = results
+    assert change.blocked is not None
+    assert "narrowed" in error
+    assert client.applied == []
 
 
 def test_view_query_ignores_ddl_wrapper():

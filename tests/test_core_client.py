@@ -18,10 +18,12 @@ from typing import Any
 
 import pytest
 from snowflake.core.stream import Stream, StreamSourceTable
+from snowflake.core.dynamic_table import UserDefinedLag
 from snowflake.core.task import Cron, Task
 
 from snowrig.resources.core_client import (
     CoreObjectClient,
+    _coerce_dynamic_table_body,
     _coerce_stream_body,
     _coerce_task_body,
     _reorder_new_columns_to_end,
@@ -57,6 +59,40 @@ def test_stream_source_already_concrete_is_left_alone():
     coerced = _coerce_stream_body(body)
 
     assert coerced["stream_source"] is source
+
+
+# --------------------------------------------------------------------- #
+# _coerce_dynamic_table_body
+# --------------------------------------------------------------------- #
+
+def test_dynamic_table_target_lag_dict_is_coerced_to_user_defined_lag():
+    """DynamicTable.target_lag is a real object (UserDefinedLag), not a
+    plain dict — the same class of problem _coerce_stream_body solves for
+    Stream.stream_source. A bare dict passes local validation but fails
+    server-side with an opaque, bodyless 400 (caught by the smoke test's
+    dynamic-table round-trip)."""
+    body = {"target_lag": {"seconds": 3600}, "warehouse": "WH", "query": "SELECT 1"}
+
+    coerced = _coerce_dynamic_table_body(body)
+
+    assert isinstance(coerced["target_lag"], UserDefinedLag)
+    assert coerced["target_lag"].seconds == 3600
+    assert coerced["warehouse"] == "WH"  # untouched
+
+
+def test_dynamic_table_body_without_target_lag_is_unchanged():
+    body = {"warehouse": "WH", "query": "SELECT 1"}
+
+    assert _coerce_dynamic_table_body(body) == body
+
+
+def test_dynamic_table_target_lag_already_concrete_is_left_alone():
+    lag = UserDefinedLag(seconds=120)
+    body = {"target_lag": lag}
+
+    coerced = _coerce_dynamic_table_body(body)
+
+    assert coerced["target_lag"] is lag
 
 
 # --------------------------------------------------------------------- #

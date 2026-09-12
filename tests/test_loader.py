@@ -161,6 +161,39 @@ def test_missing_path_params_key_raises_manifest_error(tmp_path):
         load_manifest_dir(tmp_path)
 
 
+def test_path_params_missing_name_raises_manifest_error(tmp_path):
+    _write(
+        tmp_path / "broken.yaml",
+        """
+        resource: warehouse
+        path_params: {}
+        body: {}
+        """,
+    )
+
+    with pytest.raises(ManifestError, match="'path_params' is missing required key 'name'"):
+        load_manifest_dir(tmp_path)
+
+
+def test_body_containing_name_key_raises_manifest_error(tmp_path):
+    """core_client.create_or_alter() builds `model_cls(name=path_params['name'],
+    **body)` — a `name` key inside `body` collides with that kwarg. Previously
+    this only surfaced as a bare `TypeError: got multiple values for keyword
+    argument 'name'` deep inside apply(); it should be caught at load time
+    with a message that names the offending file instead."""
+    _write(
+        tmp_path / "broken.yaml",
+        """
+        resource: table
+        path_params: {database: DB, schema: PUBLIC, name: T}
+        body: {name: T, columns: []}
+        """,
+    )
+
+    with pytest.raises(ManifestError, match="'body' must not contain a 'name' key"):
+        load_manifest_dir(tmp_path)
+
+
 def test_error_message_includes_offending_file_path(tmp_path):
     bad_file = tmp_path / "subdir/broken.yaml"
     _write(bad_file, "body: {}")

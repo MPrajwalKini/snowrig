@@ -126,6 +126,19 @@ Non-destructive changes (new columns, new objects, scalar field updates)
 always apply normally; the gate only affects changes that would drop
 something.
 
+Both commands use their exit code to say what actually happened, not
+just that the process ran — safe for CI to check directly instead of
+parsing stdout:
+
+| Command | Exit 0 | Exit 1 | Exit 2 |
+|---|---|---|---|
+| `snowrig plan` | diff computed cleanly (regardless of what it found) | couldn't compute a diff for one or more objects | — |
+| `snowrig apply` | everything applied (or nothing to do) | at least one change failed outright | nothing failed, but a destructive change was blocked |
+
+A malformed manifest, a dependency cycle, or a bad profile/credential
+config exits 1 with a one-line `Error: ...` message, not a Python
+traceback.
+
 ## Using snowrig as a library
 
 `plan()`/`apply()` are also a public, importable API — the CLI is a thin
@@ -291,11 +304,20 @@ resolution, SQL execution, the public API's connection-lifecycle
 handling, and the `serve` API's auth/routing.
 
 Not yet built: broader resource coverage (`snowflake.core` supports far
-more than the 6 types wired up in `resources/core_registry.py` — adding
+more than the 12 types wired up in `resources/core_registry.py` — adding
 one is a few lines, see that file), grants/roles, OAuth as an auth
 option, PyPI packaging (published to TestPyPI; not yet to real PyPI),
 query allowlisting/rate limiting on `snowrig serve` (deliberately out of
 scope for now — see the API section above).
+
+Also worth knowing: removing an object's manifest file does **not**
+delete it live. `plan()`/`apply()` only ever act on objects still
+present in the manifest — there's no periodic reconciliation against
+"everything snowrig has ever created," on purpose, since that would
+require either a state file or listing every live object of every
+supported resource type on every `plan()`. If you delete a table's
+YAML, the table stays in Snowflake; drop it yourself if that's what you
+meant.
 
 ## Layout
 

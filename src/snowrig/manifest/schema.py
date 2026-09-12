@@ -109,21 +109,11 @@ class ManifestObject:
     def _arg_signature_suffix(self) -> str:
         """Renders body['arguments'] as Snowflake's '(type, type)' signature —
         overload resolution in DESCRIBE/ALTER/DROP PROCEDURE and the REST
-        nameWithArgs path param both key off argument TYPES only, not names."""
+        nameWithArgs path param both key off argument TYPES only, not names.
+        Used by key() to disambiguate overloads in the dependency graph."""
         args = self.body.get("arguments", [])
         parts = [a["datatype"] for a in args]
         return f"({', '.join(parts)})"
-
-    def fetch_path_params(self) -> dict[str, str]:
-        """Path params for fetch/delete/action calls. Differs from the create-time
-        path_params for overloadable resources (procedure/function), which need
-        the full name+signature rather than a bare name in the URL path."""
-        if self.resource not in OVERLOADABLE_RESOURCES:
-            return self.path_params
-        params = dict(self.path_params)
-        name = params.pop("name")
-        params["nameWithArgs"] = f"{name}{self._arg_signature_suffix()}"
-        return params
 
     def implicit_dependency(self) -> ObjectKey | None:
         """The database/schema this object lives in, if any."""

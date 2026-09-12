@@ -63,6 +63,11 @@ def topological_order(nodes: list[PlanNode]) -> list[PlanNode]:
     by_key = {n.key: n for n in nodes}
     in_degree = {n.key: 0 for n in nodes}
     dependents: dict[ObjectKey, list[ObjectKey]] = {n.key: [] for n in nodes}
+    # Precomputed once so the "stable order" tie-break below is an O(1)
+    # lookup per comparison instead of an O(n) nodes.index() scan repeated
+    # on every sort — the previous version was effectively O(n^2 log n) on
+    # large manifests for no behavioral difference.
+    order_index = {n.key: i for i, n in enumerate(nodes)}
 
     for n in nodes:
         for dep in n.depends_on:
@@ -74,7 +79,7 @@ def topological_order(nodes: list[PlanNode]) -> list[PlanNode]:
     ordered: list[PlanNode] = []
 
     while ready:
-        ready.sort(key=lambda k: nodes.index(by_key[k]))
+        ready.sort(key=order_index.__getitem__)
         current = ready.pop(0)
         ordered.append(by_key[current])
         for dependent in dependents[current]:

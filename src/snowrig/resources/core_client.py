@@ -97,9 +97,32 @@ def _coerce_task_body(body: dict[str, Any]) -> dict[str, Any]:
 # YAML) and returns a body dict safe to pass into `ModelClass(**body)`.
 # Add an entry here whenever a resource has a field the generic passthrough
 # gets wrong (see the note above and CONTRIBUTING.md).
+def _coerce_dynamic_table_body(body: dict[str, Any]) -> dict[str, Any]:
+    """DynamicTable.target_lag is typed as a real object (UserDefinedLag, or
+    DownstreamLag for 'lag behind another dynamic table' — see Snowflake's
+    docs), not a plain dict, the same class of problem _coerce_stream_body
+    solves for Stream.stream_source. A bare `target_lag: {seconds: N}` dict
+    passes local pydantic validation far enough to reach the wire, then
+    fails server-side with an opaque, bodyless 400 — caught by the smoke
+    test's dynamic-table round-trip check. Accept the common shape:
+
+        target_lag: {seconds: 3600}   -> UserDefinedLag(seconds=3600)
+
+    `downstream: true` (matching Snowflake's own TARGET_LAG = DOWNSTREAM
+    syntax) is intentionally not handled here yet — add DownstreamLag
+    support if/when a manifest actually needs it."""
+    target_lag = body.get("target_lag")
+    if isinstance(target_lag, dict):
+        from snowflake.core.dynamic_table import UserDefinedLag
+
+        body = {**body, "target_lag": UserDefinedLag(**target_lag)}
+    return body
+
+
 _BODY_COERCERS = {
     "stream": _coerce_stream_body,
     "task": _coerce_task_body,
+    "dynamic-table": _coerce_dynamic_table_body,
 }
 
 

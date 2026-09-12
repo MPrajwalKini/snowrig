@@ -45,11 +45,26 @@ def _load_one(path: Path) -> ManifestObject:
             f"{path}: 'path_params' must be a mapping of key: value pairs "
             f"(e.g. database: DB), got {type(doc['path_params']).__name__}"
         )
+    if "name" not in doc["path_params"]:
+        raise ManifestError(f"{path}: 'path_params' is missing required key 'name'")
+    body = doc.get("body", {}) or {}
+    if isinstance(body, dict) and "name" in body:
+        # core_client.create_or_alter() constructs the snowflake.core model
+        # as `model_cls(name=path_params["name"], **body)` — a `name` key
+        # inside `body` collides with that and previously surfaced as a
+        # bare `TypeError: got multiple values for keyword argument 'name'`
+        # deep inside apply(), pointing nowhere near the actual manifest
+        # file. Catch it here instead, at load time, with a message that
+        # names the offending file.
+        raise ManifestError(
+            f"{path}: 'body' must not contain a 'name' key — the object's "
+            f"name belongs in 'path_params.name', not 'body.name'"
+        )
 
     return ManifestObject(
         resource=doc["resource"],
         path_params={k: str(v) for k, v in doc["path_params"].items()},
-        body=doc.get("body", {}) or {},
+        body=body,
         depends_on=list(doc.get("depends_on", []) or []),
         sql=doc.get("sql"),
         source_path=path,

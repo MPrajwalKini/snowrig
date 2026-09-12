@@ -4,9 +4,10 @@ path_params:
   schema: PUBLIC
   name: CUSTOMERS_SUMMARY
 body:
-  # target_lag is a concrete (non-discriminated) nested model, so a plain
-  # dict auto-coerces fine here — no _BODY_COERCERS entry needed, unlike
-  # Stream.stream_source. See CONTRIBUTING.md.
+  # target_lag needs a real UserDefinedLag object, not a plain dict — the
+  # same class of problem Stream.stream_source has. core_client.py's
+  # _coerce_dynamic_table_body() handles the translation below for you.
+  # See CONTRIBUTING.md.
   target_lag:
     seconds: 60
   warehouse: COMPUTE_WH

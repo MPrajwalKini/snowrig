@@ -102,6 +102,56 @@ def _normalize_datatype(dt: Any) -> str:
     return _DATATYPE_DEFAULTS.get(s, s)
 
 
+_DATATYPE_PARTS_RE = re.compile(r"^([A-Z_]+)(?:\(([^)]*)\))?$")
+
+
+def _parse_datatype(dt_normalized: str) -> tuple[str, tuple[int, ...]]:
+    """'VARCHAR(150)' -> ('VARCHAR', (150,)); 'NUMBER(38,2)' -> ('NUMBER',
+    (38, 2)); 'VARIANT' -> ('VARIANT', ()). Any parameter that isn't a
+    plain integer (unexpected shape) yields no params rather than raising,
+    so callers can treat that as "can't compare, don't guess"."""
+    match = _DATATYPE_PARTS_RE.match(dt_normalized)
+    if not match:
+        return dt_normalized, ()
+    family, params_str = match.group(1), match.group(2)
+    if not params_str:
+        return family, ()
+    params: list[int] = []
+    for part in params_str.split(","):
+        try:
+            params.append(int(part.strip()))
+        except ValueError:
+            return family, ()
+    return family, tuple(params)
+
+
+def _is_lossy_datatype_narrowing(live_dt: Any, desired_dt: Any) -> bool:
+    """True if changing a column's declared type from `live_dt` to
+    `desired_dt` risks data loss or an outright apply failure: switching
+    type family entirely (e.g. VARCHAR -> NUMBER), shortening a VARCHAR/
+    CHAR/BINARY length, or reducing a NUMBER/DECIMAL's precision or scale.
+    Confirmed against a real account: Snowflake actually refuses a VARCHAR
+    length reduction outright (`CREATE OR ALTER TABLE` errors with
+    "reducing the byte-length of a varchar is not supported"), so the risk
+    here is a hard `apply()` failure at least as often as silent
+    truncation — plan() surfacing it as destructive up front, before the
+    person even attempts --allow-destructive, is the whole point; whether
+    Snowflake ends up truncating or just refusing depends on the specific
+    types involved. Returns False (not narrowing) when the two types
+    aren't comparable (different, non-numeric parameter shapes) rather
+    than guessing."""
+    live_norm, desired_norm = _normalize_datatype(live_dt), _normalize_datatype(desired_dt)
+    if live_norm == desired_norm:
+        return False
+    live_family, live_params = _parse_datatype(live_norm)
+    desired_family, desired_params = _parse_datatype(desired_norm)
+    if live_family != desired_family:
+        return True
+    if not live_params or not desired_params or len(live_params) != len(desired_params):
+        return False
+    return any(d < l for d, l in zip(desired_params, live_params))
+
+
 def _column_field_differs(key: str, live_value: Any, desired_value: Any) -> bool:
     """Per-declared-sub-field comparison for column-like list items,
     shared between _diff_list_field (change detection) and
@@ -269,10 +319,15 @@ class FieldDiff:
     # Names of list-items present live but absent from the manifest for
     # this field (e.g. dropped columns). Empty for non-destructive changes.
     removed_items: list[str] = field(default_factory=list)
+    # "NAME (LIVE_TYPE -> DESIRED_TYPE)" for columns whose datatype change
+    # could truncate or drop existing data (family change, or a same-family
+    # parameter reduction) — see _is_lossy_datatype_narrowing. Also drives
+    # is_destructive, alongside removed_items.
+    narrowed_items: list[str] = field(default_factory=list)
 
     @property
     def is_destructive(self) -> bool:
-        return bool(self.removed_items)
+        return bool(self.removed_items or self.narrowed_items)
 
     def render(self, context: int = 2) -> str:
         """Human-readable rendering of this field's change.
@@ -315,11 +370,17 @@ class PlannedChange:
         return any(d.is_destructive for d in self.diff.values())
 
     def destructive_summary(self) -> str:
-        """e.g. 'columns: EMAIL, PHONE will be dropped'"""
+        """e.g. 'columns: EMAIL, PHONE will be dropped; columns: LABEL will
+        be narrowed (VARCHAR(150) -> VARCHAR(50), possible truncation)'"""
         parts = []
         for fname, d in self.diff.items():
             if d.removed_items:
                 parts.append(f"{fname}: {', '.join(d.removed_items)} will be dropped")
+            if d.narrowed_items:
+                parts.append(
+                    f"{fname}: {', '.join(d.narrowed_items)} "
+                    f"will be narrowed (possible truncation)"
+                )
         return "; ".join(parts)
 
 
@@ -327,7 +388,9 @@ def _diff_list_field(live_value: Any, desired_value: list[dict[str, Any]]) -> Fi
     """Compares a list-of-dict field (currently: `columns`). The manifest's
     list is authoritative: any named item present live but absent from
     `desired_value` is a destructive removal, and any named item present
-    in both is compared only on the sub-fields the manifest declared."""
+    in both is compared only on the sub-fields the manifest declared. A
+    datatype change classified as lossy by _is_lossy_datatype_narrowing is
+    also destructive, even though the column itself isn't being dropped."""
     live_list: list[dict[str, Any]] = live_value if isinstance(live_value, list) else []
     live_by_name: dict[str, dict[str, Any]] = {
         str(item["name"]): item for item in live_list if isinstance(item, dict) and "name" in item
@@ -339,6 +402,7 @@ def _diff_list_field(live_value: Any, desired_value: list[dict[str, Any]]) -> Fi
     removed: list[str] = [name for name in live_by_name if name not in desired_by_name]
 
     changed = False
+    narrowed: list[str] = []
     for name, desired_item in desired_by_name.items():
         live_item = live_by_name.get(name)
         if live_item is None:
@@ -347,10 +411,12 @@ def _diff_list_field(live_value: Any, desired_value: list[dict[str, Any]]) -> Fi
         for k, v in desired_item.items():
             if _column_field_differs(k, live_item.get(k), v):
                 changed = True
+                if k == "datatype" and _is_lossy_datatype_narrowing(live_item.get(k), v):
+                    narrowed.append(f"{name} ({_normalize_datatype(live_item.get(k))} -> {_normalize_datatype(v)})")
 
     if not removed and not changed:
         return None
-    return FieldDiff(live=live_value, desired=desired_value, removed_items=removed)
+    return FieldDiff(live=live_value, desired=desired_value, removed_items=removed, narrowed_items=narrowed)
 
 
 def _dict_values_match(live_value: Any, desired_value: dict[str, Any]) -> bool:
@@ -462,8 +528,20 @@ def apply_plan(
                 f"{change.destructive_summary()}"
             )
             results.append((change, change.blocked))
-            if stop_on_error:
-                break
+            # NOT respecting stop_on_error here, deliberately: a block is an
+            # intentional, expected outcome of the safety gate, not a
+            # failure. `stop_on_error` exists to stop a batch when something
+            # actually went wrong (an exception, a fetch that came back
+            # unreadable) — it must not also mean "one blocked destructive
+            # change anywhere in the plan silently prevents every other,
+            # unrelated, perfectly safe change in the same apply() from
+            # being attempted at all." That would make --allow-destructive's
+            # default (blocked) state far more disruptive than the docs
+            # promise ("the gate only affects changes that would drop
+            # something"), and worse, it fails silently: the skipped
+            # objects don't even appear in the returned results, so nothing
+            # here or in the CLI's output would tell the person their other
+            # changes never ran.
             continue
 
         if dry_run:

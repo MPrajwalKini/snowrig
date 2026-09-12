@@ -12,13 +12,30 @@ from snowflake.core import Root
 
 import snowrig
 from snowrig import Action, PlannedChange
-from snowrig.config import DEFAULT_CONFIG_PATH, load_profile
+from snowrig.config import DEFAULT_CONFIG_PATH, CredentialError, load_profile
 from snowrig.connection import connect
+from snowrig.manifest.graph import DependencyError
+from snowrig.manifest.loader import ManifestError
 from snowrig.resources.core_client import CoreObjectClient
 from snowrig.sql import SqlRunner
 
 app = typer.Typer(help="snowrig — free, always-available Snowflake automation on top of Snowflake's own SDKs.")
 console = Console()
+
+# Exceptions snowrig itself raises with an already-clear, user-facing
+# message — a manifest problem, a dependency cycle, or a credential/config
+# problem. Letting these propagate as raw Python tracebacks (Typer/Click's
+# default for any unhandled exception) buries that message under a wall of
+# stack frames the person doesn't need. Third-party exceptions (a
+# snowflake.connector auth failure, say) are deliberately NOT caught here —
+# those aren't ours to reword, and Snowflake's own error text is usually
+# informative enough on its own.
+_CLI_KNOWN_ERRORS = (ManifestError, DependencyError, CredentialError, FileNotFoundError, KeyError)
+
+
+def _fail(message: str) -> None:
+    console.print(f"[red]Error:[/red] {message}")
+    raise typer.Exit(1)
 
 
 @app.command()
@@ -55,7 +72,10 @@ def exec(
     profile: str = "default",
 ) -> None:
     """Run a single SQL statement and print the results."""
-    prof = load_profile(profile)
+    try:
+        prof = load_profile(profile)
+    except _CLI_KNOWN_ERRORS as exc:
+        _fail(str(exc))
     conn = connect(prof)
     try:
         rows = SqlRunner(conn).run(
@@ -81,7 +101,10 @@ def transaction(
     profile: str = "default",
 ) -> None:
     """Run multiple statements as a single transaction (all commit together, or none do)."""
-    prof = load_profile(profile)
+    try:
+        prof = load_profile(profile)
+    except _CLI_KNOWN_ERRORS as exc:
+        _fail(str(exc))
     conn = connect(prof)
     try:
         SqlRunner(conn).run_transaction(
@@ -103,7 +126,10 @@ def fetch(
     profile: str = "default",
 ) -> None:
     """Fetch a single object's current definition."""
-    prof = load_profile(profile)
+    try:
+        prof = load_profile(profile)
+    except _CLI_KNOWN_ERRORS as exc:
+        _fail(str(exc))
     conn = connect(prof)
     try:
         root = Root(conn)
@@ -159,7 +185,11 @@ def plan(
     profile: str = "default",
 ) -> None:
     """Diff a manifest against live Snowflake state without changing anything."""
-    plan_result = snowrig.plan(manifest_dir, profile=profile)
+    try:
+        plan_result = snowrig.plan(manifest_dir, profile=profile)
+    except _CLI_KNOWN_ERRORS as exc:
+        _fail(str(exc))
+
     if not plan_result:
         console.print(f"[yellow]No .yaml objects found under {manifest_dir}[/yellow]")
         return
@@ -182,6 +212,9 @@ def plan(
         summary += f", [red]{destructive} destructive (blocked without --allow-destructive)[/red]"
     console.print(summary + ".")
 
+    if any(c.action == Action.ERROR for c in plan_result):
+        raise typer.Exit(1)  # couldn't even compute a diff for one or more objects
+
 
 @app.command()
 def apply(
@@ -199,30 +232,49 @@ def apply(
         ),
     ),
 ) -> None:
-    """Apply a manifest to Snowflake, in dependency order."""
-    results = snowrig.apply(
-        manifest_dir,
-        profile=profile,
-        dry_run=dry_run,
-        stop_on_error=not continue_on_error,
-        allow_destructive=allow_destructive,
-    )
+    """Apply a manifest to Snowflake, in dependency order.
+
+    Exit codes (so CI can tell what actually happened, not just that the
+    command ran): 0 — everything applied (or there was nothing to do).
+    1 — at least one change failed outright. 2 — nothing failed, but at
+    least one destructive change was blocked (needs --allow-destructive
+    or a manifest fix) — not a crash, but not a clean success either.
+    """
+    try:
+        results = snowrig.apply(
+            manifest_dir,
+            profile=profile,
+            dry_run=dry_run,
+            stop_on_error=not continue_on_error,
+            allow_destructive=allow_destructive,
+        )
+    except _CLI_KNOWN_ERRORS as exc:
+        _fail(str(exc))
 
     if not results:
         console.print("[dim]Nothing to do — live state already matches the manifest.[/dim]")
         return
 
     console.print(f"Applied/attempted {len(results)} change(s){' (dry run)' if dry_run else ''}...")
+    has_error = False
+    has_blocked = False
     for change, error in results:
         label = f"{change.key.resource}:{change.key.qualified_name}"
         if change.blocked:
+            has_blocked = True
             console.print(f"  [yellow]BLOCKED[/yellow]  {label} — {change.blocked}")
         elif error:
+            has_error = True
             console.print(f"  [red]FAILED[/red]  {label} — {error}")
         elif dry_run:
             console.print(f"  [dim]WOULD APPLY[/dim]  {label}")
         else:
             console.print(f"  [green]APPLIED[/green]  {label}")
+
+    if has_error:
+        raise typer.Exit(1)
+    if has_blocked:
+        raise typer.Exit(2)
 
 
 @app.command()
